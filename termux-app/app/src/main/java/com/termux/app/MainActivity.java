@@ -16,9 +16,11 @@ import android.os.Looper;
 import android.provider.Settings;
 import android.text.InputType;
 import android.util.Log;
+import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import com.termux.shared.android.PermissionUtils;
@@ -135,6 +137,12 @@ public class MainActivity extends Activity {
     /** 启动项目时悬浮窗权限未开：记 pending，用户去系统设置授权返回后 onResume 补开悬浮球 */
     private boolean mFloatPendingStart = false;
 
+    /** 启动遮罩：冷启动初始化期间盖住页面，显示「缓冲圈 + 当前在干什么」 */
+    private View startupOverlay;
+
+    /** 遮罩上的状态文字（随初始化步骤推进，见 setStartupStatus） */
+    private TextView tvStartupStatus;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -143,14 +151,44 @@ public class MainActivity extends Activity {
         initViews();            // 1. 绑定布局控件
         setListeners();         // 2. 设置点击监听
 
-        // 3. 确保辅助脚本（start.sh / init_container.sh）已释放到 Termux home
-        //    （初始化与启动命令都依赖它们）
-        AssetsUtils.ensureScripts(this);
+        // 3. 首帧优先：把初始化整段推迟到首帧绘制之后再跑。
+        //    此前这些步骤（释放脚本 / 写属性 / 扫容器目录 / 读崩溃日志）全排在
+        //    setContentView 之后同步执行，首帧一直画不出来，屏幕上只剩主题的
+        //    windowBackground —— 夜间是 #121212，观感就是「黑屏卡住」。
+        //    现在先让「缓冲圈 + 状态文字」这一屏绘制出去，再开始干活。
+        //
+        //    页面重建（旋转 / 分屏）时不走遮罩：内容早已在内存里，再挡一层反而多余，
+        //    初始化本身是幂等的，直接跑第二段即可（遮罩保持布局里的 gone 状态）。
+        if (savedInstanceState != null) {
+            runStartupTasksOnMain();
+        } else {
+            startupOverlay.setVisibility(View.VISIBLE);
+            getWindow().getDecorView().post(this::runStartupTasks);
+        }
+    }
 
+    /**
+     * 初始化第一段：把最重的一步挪到子线程，主线程空出来把启动遮罩画出去。
+     *
+     * AssetsUtils.ensureScripts 要读 6 个 assets（含 init_container.sh 等）+ 算 12 次
+     * SHA-256，是全流程里唯一明显耗时的同步 IO；其余步骤都是几十毫秒量级的文件检查，
+     * 留在主线程按序跑即可。状态文字要真被用户看见，主线程就不能被这一步堵住。
+     */
+    private void runStartupTasks() {
+        setStartupStatus(R.string.startup_release_scripts);
+        new Thread(() -> {
+            AssetsUtils.ensureScripts(this);
+            mainHandler.post(this::runStartupTasksOnMain);
+        }, "startup-assets").start();
+    }
+
+    /** 初始化第二段（主线程）：轻量步骤按序跑完，撤掉遮罩后再弹各类引导窗 */
+    private void runStartupTasksOnMain() {
         // 3.5 确保 Termux 允许外部应用调用 RUN_COMMAND：
         //     把 allow-external-apps=true 写入 termux.properties 并重载到内存。
         //     否则 RunCommandService 会拒绝本 App 发起的命令（默认策略），
         //     这也是此前「终端/启动项目/一键初始化」闪退的根因之一。
+        setStartupStatus(R.string.startup_prepare_env);
         ensureAllowExternalAppsEnabled();
 
         // 3.6 确保 Termux 基础环境（bootstrap）已安装。
@@ -170,17 +208,21 @@ public class MainActivity extends Activity {
         });
 
         // 4. 同步底部「一键初始化」按钮状态（容器未安装时可用，已安装则禁用）
+        setStartupStatus(R.string.startup_check_status);
         refreshInitStatus();
+
+        // 5. 主界面启动时的静默更新检查（有新版才弹窗，不打扰；内部起线程）
+        checkUpdateSilently();
+
+        // 6. 首次探测项目运行状态，同步按钮文案（内部起线程）
+        refreshProjectStatus();
+
+        // 界面已就绪：先撤遮罩再弹窗，遮罩和对话框不能叠在一起
+        hideStartupOverlay();
 
         // 4.5 首次初始化引导：容器未安装时弹窗引导「一键初始化」
         //     （弹窗被「暂不」后仍可通过底部「一键初始化」按钮再次进入）
         showInitGuideDialogIfNeeded();
-
-        // 5. 主界面启动时的静默更新检查（有新版才弹窗，不打扰）
-        checkUpdateSilently();
-
-        // 6. 首次探测项目运行状态，同步按钮文案
-        refreshProjectStatus();
 
         // 6.5 崩溃日志展示：上次闪退的堆栈会自动写入 crash_log.md，
         //     有则弹窗显示，方便直接复制给开发者定位
@@ -190,6 +232,18 @@ public class MainActivity extends Activity {
         //    「显示在其他应用上层」权限；否则 TermuxService 启动会话时
         //    startTermuxActivity() 会直接 toast 警告并卡住进程（截图中的报错）
         checkOverlayPermission();
+    }
+
+    /** 更新启动遮罩上的状态文字（遮罩已撤则静默忽略，不做无效刷新） */
+    private void setStartupStatus(int stringRes) {
+        if (startupOverlay == null || tvStartupStatus == null) return;
+        if (startupOverlay.getVisibility() != View.VISIBLE) return;
+        tvStartupStatus.setText(stringRes);
+    }
+
+    /** 撤掉启动遮罩：初始化结束，露出主界面 */
+    private void hideStartupOverlay() {
+        if (startupOverlay != null) startupOverlay.setVisibility(View.GONE);
     }
 
     /**
@@ -268,6 +322,17 @@ public class MainActivity extends Activity {
         maybeAutoReinitFromTrigger();
     }
 
+    @Override
+    protected void onDestroy() {
+        // ADB 面板解绑：配对结果是无障碍服务/通知输入接收者异步回报的（AdbPairPanel.refreshActive），
+        // 页面销毁后不能再往它身上刷状态
+        if (mAdbPanel != null) {
+            mAdbPanel.detach();
+            mAdbPanel = null;
+        }
+        super.onDestroy();
+    }
+
     /**
      * 自动化/排障触发入口：检测到 <files>/home/.reinit_trigger 标志文件时，
      * 静默删除标志并自动执行初始化（幂等，等价于用户点「重新初始化」并确认）。
@@ -311,11 +376,30 @@ public class MainActivity extends Activity {
     private AlertDialog mOverlayPermDialog = null;
 
     /** 绑定布局中的控件 */
+    /**
+     * 权限请求结果回调：转交给 ADB 面板。
+     *
+     * 为什么必须转发并等回调：Android 13+ 的通知权限对话框挂在当前 Activity 上，
+     * 如果在 requestPermissions 之后立刻 startActivity 跳到系统「无线调试」页，
+     * 对话框会被压在后台直接消失、回调收到「拒绝」—— 用户永远授权不了，也就看不到
+     * 自动配对的通知进度。所以 ADB 面板的流程是「先申请 → 回调里再跳转」。
+     */
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (mAdbPanel != null) {
+            mAdbPanel.onRequestPermissionsResult(requestCode);
+        }
+    }
+
     private void initViews() {
         btnTerminal = findViewById(R.id.btn_terminal);
         btnProject = findViewById(R.id.btn_project);
         btnInit = findViewById(R.id.btn_init);
         btnCheckUpdate = findViewById(R.id.btn_check_update);
+        // 启动遮罩（默认可见；初始化跑完由 hideStartupOverlay 撤掉）
+        startupOverlay = findViewById(R.id.startup_overlay);
+        tvStartupStatus = findViewById(R.id.tv_startup_status);
         // ADB 配对直接内嵌在主界面卡片上（构造即绑定控件并做一次状态检测）
         mAdbPanel = new AdbPairPanel(this);
     }
@@ -606,12 +690,27 @@ public class MainActivity extends Activity {
             new AlertDialog.Builder(this)
                     .setTitle(R.string.init_reinit_title)
                     .setMessage(R.string.init_reinit_message)
-                    .setPositiveButton(R.string.action_reinit, (dialog, which) -> doStartInit())
+                    .setPositiveButton(R.string.action_reinit, (dialog, which) -> showInitBranchPicker())
                     .setNegativeButton(android.R.string.cancel, null)
                     .show();
             return;
         }
-        doStartInit();
+        // 首次初始化：先问用哪个分支安装（默认勾选当前分支），选完才真正开跑
+        showInitBranchPicker();
+    }
+
+    /**
+     * 初始化前的分支询问。
+     *
+     * 为什么要问：init_container.sh 的 git clone 是按 ~/repo_branch.txt 决定克隆哪条
+     * 分支的，所以「初始化」是唯一能决定装出来是 main 还是 dev 的时机——装好之后再想
+     * 换分支就得走「切换分支」（那条路径会自动 fetch + checkout，见 applyUpdateBranch）。
+     *
+     * 复用「切换分支」的选择器（远端列表 + 自定义输入），只把选完后的动作用回调换成
+     * doStartInit；点「使用当前分支」则不改分支直接开跑。
+     */
+    private void showInitBranchPicker() {
+        showBranchPickerDialog(this::doStartInit);
     }
 
     /** startInit 实际执行体（确认后或首次初始化直接进入） */
@@ -1059,21 +1158,30 @@ public class MainActivity extends Activity {
 
     // ==================== 更新分支选择（便于在手机上测试分支代码） ====================
 
+    /** 「检查更新」里的切换分支入口：选完分支即切过去并拉代码（见 applyUpdateBranch） */
+    private void showBranchPickerDialog() {
+        showBranchPickerDialog(null);
+    }
+
     /**
      * 打开分支选择：子线程拉远端分支列表，回到主线程弹单选列表。
      * 拉取失败（无网/限流）不阻断，直接转手动输入分支名。
+     *
+     * @param onPicked 选完分支后的回调；null = 更新场景，非 null = 初始化场景
+     *                 （见 showInitBranchPicker）。两种场景共用列表/输入部分，
+     *                 差别只在「选完之后干什么」。
      */
-    private void showBranchPickerDialog() {
+    private void showBranchPickerDialog(Runnable onPicked) {
         Toast.makeText(this, R.string.update_branch_loading, Toast.LENGTH_SHORT).show();
         new Thread(() -> {
             final List<String> branches = UpdateChecker.listBranches();
             mainHandler.post(() -> {
                 if (branches == null) {
                     Toast.makeText(this, R.string.update_branch_fetch_failed, Toast.LENGTH_SHORT).show();
-                    showCustomBranchDialog(getUpdateBranch());
+                    showCustomBranchDialog(getUpdateBranch(), onPicked);
                     return;
                 }
-                showBranchListDialog(getUpdateBranch(), branches);
+                showBranchListDialog(getUpdateBranch(), branches, onPicked);
             });
         }).start();
     }
@@ -1081,8 +1189,11 @@ public class MainActivity extends Activity {
     /**
      * 分支单选列表：远端分支 + 保证「当前分支」「默认分支」一定在列表里，
      * 末尾追加「自定义输入…」。
+     *
+     * 负按钮按场景区分：初始化场景是「使用当前分支」（点了不换分支直接开跑），
+     * 更新场景仍是「暂不」（纯关闭）。
      */
-    private void showBranchListDialog(String current, List<String> remoteBranches) {
+    private void showBranchListDialog(String current, List<String> remoteBranches, Runnable onPicked) {
         List<String> candidates = new ArrayList<>(remoteBranches);
         if (!candidates.contains(current)) {
             candidates.add(0, current);       // 当前分支（可能已删除/未出现在接口里）放最前
@@ -1098,21 +1209,26 @@ public class MainActivity extends Activity {
         }
         items[items.length - 1] = getString(R.string.update_branch_custom);
 
-        new AlertDialog.Builder(this)
-                .setTitle(R.string.update_branch_title)
+        AlertDialog.Builder builder = new AlertDialog.Builder(this)
+                .setTitle(onPicked != null ? R.string.init_branch_title : R.string.update_branch_title)
                 .setItems(items, (dialog, which) -> {
                     if (which == items.length - 1) {
-                        showCustomBranchDialog(current);
+                        showCustomBranchDialog(current, onPicked);
                     } else {
-                        applyUpdateBranch(candidates.get(which));
+                        applyUpdateBranch(candidates.get(which), onPicked);
                     }
-                })
-                .setNegativeButton(R.string.update_button_later, null)
-                .show();
+                });
+        if (onPicked != null) {
+            // 初始化场景：给一个「不改分支，直接开始」的出口
+            builder.setNegativeButton(R.string.init_branch_keep, (dialog, which) -> onPicked.run());
+        } else {
+            builder.setNegativeButton(R.string.update_button_later, null);
+        }
+        builder.show();
     }
 
     /** 手动输入分支名（列表取不到或想用列表外的分支时） */
-    private void showCustomBranchDialog(String current) {
+    private void showCustomBranchDialog(String current, Runnable onPicked) {
         final EditText input = new EditText(this);
         input.setSingleLine(true);
         // 分支名是英文：用 URI 变体键盘（偏英文、无联想），避免中文输入法直接输入出非法名字
@@ -1137,18 +1253,38 @@ public class MainActivity extends Activity {
                         Toast.makeText(this, R.string.update_branch_invalid, Toast.LENGTH_SHORT).show();
                         return;
                     }
-                    applyUpdateBranch(branch);
+                    applyUpdateBranch(branch, onPicked);
                 })
                 .setNegativeButton(R.string.update_button_later, null)
                 .show();
     }
 
-    /** 保存分支选择 → 同步容器记录文件 → 立刻按新分支重新检测更新 */
-    private void applyUpdateBranch(String branch) {
+    /**
+     * 保存分支选择 → 同步容器记录文件（~/repo_branch.txt）→ 按场景分发。
+     *
+     * 三种去向：
+     *   1. 初始化场景（onPicked 非空）：立刻开跑初始化，容器内 git clone 按新分支拉代码；
+     *   2. 更新场景且项目已装：直接 performUpdate()（git fetch + checkout -f -B <分支>）
+     *      —— 即使该分支一个提交都没更新，也会真的切过去并 uv sync，
+     *      「切换分支即下载对应分支代码」靠的就是这条；
+     *   3. 更新场景但项目未装：没有 /root/app 可切，仅按新分支重新检测。
+     */
+    private void applyUpdateBranch(String branch, Runnable onPicked) {
         setUpdateBranch(branch);
         String saved = getUpdateBranch();
-        Toast.makeText(this, getString(R.string.update_branch_saved, saved), Toast.LENGTH_SHORT).show();
-        runCheckUpdate();
+
+        if (onPicked != null) {
+            Toast.makeText(this, getString(R.string.update_branch_saved, saved), Toast.LENGTH_SHORT).show();
+            onPicked.run();
+            return;
+        }
+        if (isProjectInitialized()) {
+            Toast.makeText(this, getString(R.string.update_branch_switching, saved), Toast.LENGTH_SHORT).show();
+            performUpdate();
+        } else {
+            Toast.makeText(this, getString(R.string.update_branch_saved, saved), Toast.LENGTH_SHORT).show();
+            runCheckUpdate();
+        }
     }
 
     /**

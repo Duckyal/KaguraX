@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    冷启动窗背景（夜间版）：与 drawable/bg_splash.xml 结构一致，仅底色换成
+    bg_night。分开两份而不是在 drawable 里引用 ?attr/mainPageBackground，
+    是因为 windowBackground 在窗口创建阶段解析，走 @color 更稳妥。
+
+    图标同为品牌 logo（@drawable/ic_splash_logo，多密度 PNG）。
+-->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@color/bg_night" />
+
+    <item
+        android:drawable="@drawable/ic_splash_logo"
+        android:gravity="center" />
+</layer-list>

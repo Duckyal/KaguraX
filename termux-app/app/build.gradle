@@ -55,8 +55,8 @@ android {
         // 本地 0.118.0 > 远端 1.0.0 会永远误报「有新 APK」。
         // 发新版 APK 时：versionCode 必须递增(Android 覆盖安装要求)，versionName
         // 与 Release tag 一致；也可用环境变量 TERMUX_APP_VERSION_NAME 覆盖。
-        versionCode 125
-        versionName "1.2.0"
+        versionCode 127
+        versionName "1.2.1"
 
         if (appVersionName) versionName = appVersionName
         validateVersionName(versionName)
@@ -83,13 +83,14 @@ android {
                 enable ((gradle.startParameter.taskNames.any { it.contains("Debug") } && splitAPKsForDebugBuilds == "1") ||
                     (gradle.startParameter.taskNames.any { it.contains("Release") } && splitAPKsForReleaseBuilds == "1"))
                 reset ()
-                // 默认仅打包 arm64-v8a；设置环境变量 TERMUX_TEST_ABIS=x86_64 可追加
-                // 测试架构（用于在 x86_64 redroid 模拟器上实测初始化流程）。
+                // 默认同时打包 arm64-v8a（真机）与 x86_64（PC 模拟器/redroid 上测试，
+                // 免去反复往手机传包）；设置环境变量 TERMUX_TEST_ABIS 可追加其它
+                // 架构（如 x86）。
                 def testAbis = []
                 if (System.getenv("TERMUX_TEST_ABIS") != null) {
                     System.getenv("TERMUX_TEST_ABIS").split(",").each { testAbis << it }
                 }
-                def abiList = (["arm64-v8a"] + testAbis).unique()
+                def abiList = (["arm64-v8a", "x86_64"] + testAbis).unique()
                 include abiList as String[]
                 universalApk false
             }

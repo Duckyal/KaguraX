@@ -2,109 +2,149 @@ package com.termux.app;
 
 import com.termux.R;
 
+import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
+import android.content.ComponentName;
 import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
-import android.view.View;
+import android.provider.Settings;
+import android.util.Log;
 import android.widget.Button;
-import android.widget.EditText;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.nio.charset.StandardCharsets;
-import java.util.Map;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
+
+import java.lang.ref.WeakReference;
 
 /**
- * AdbPairPanel —— 主界面内嵌的 ADB 无线配对面板（取代原弹窗，逻辑直接铺在主界面）。
+ * AdbPairPanel —— 主界面内嵌的 ADB 无线调试面板（极简形态）。
  *
- * 它把原 AdbPairDialog 的界面与逻辑全部搬到 MainActivity 的卡片上：
- *   - 顶部状态条：App 进程内执行 adb devices，实时显示
- *     「已连接：<ip:port>」（绿）/「未连接 · 请先首次配对」/「未连接 · 请点击连接」等
- *   - 「连接 / 首次配对」互斥切换：一次只展开一个区块（默认展开「连接」），
- *     切换标题高亮当前区块，避免连接输入框与配对输入框同时占页面
- *   - 「连接」区块：连接地址 + 「连接」按钮，记住上次地址自动填入
- *   - 「首次配对」区块：配对地址 + 6 位配对码 + 「配对」按钮
- *     （配对码每次都会变，不保存；配对成功后自动用同 IP:5555 发起连接）
+ * 界面结构（activity_main.xml 的 ADB 区块）只有四样东西：
+ *   - 顶部状态条：App 进程内执行 adb devices，实时显示「已连接：<地址>」（绿）
+ *     /「未连接 · 请先配对」/「未连接 · 请点「配对 / 连接」」等
+ *   - 一段说明文字
+ *   - 唯一入口按钮「配对 / 连接」
+ *   - 右下角小字「自动失败？手动填写」（手动兜底入口）
  *
- * 设计要点（沿用原 AdbPairDialog）：
- *   1. 状态检测用 Runtime.exec 在 App 进程内执行 adb devices，只认实时事实、不做缓存；
- *   2. 配对/连接全程后台静默执行（Runtime.exec），结果用 Toast 反馈，不再跳转终端；
- *   3. 面板是 Activity 布局的一部分，结果 Toast 直接浮在页面上方，不存在被弹窗挡住的问题；
- *   4. MainActivity.onResume 时调用 {@link #refresh()}，回到主界面即重新检测连接状态。
+ * ## 为什么主页不留端口输入框，也不靠浮窗
+ * 端口、配对码、连接端口三者都只在系统「无线调试」页上显示，且每次开关无线调试都会重新
+ * 随机生成 —— 放主页只会逼用户在两个应用之间来回手抄。
  *
- * 构造后自动绑定主界面 activity_main.xml 中 ADB 区块的控件并做一次状态检测。
+ * 悬浮窗也不行：Android 12 起系统「设置」持有 HIDE_OVERLAY_WINDOWS 权限，会主动隐藏第三方
+ * TYPE_APPLICATION_OVERLAY 窗口 —— 浮窗在「无线调试」页上**根本不可能出现**（这跟「显示在
+ * 其他应用上层」权限无关，给了也一样）。那一页上唯一既看得见、又能输入的载体是通知栏，
+ * 所以手动兜底做成了「可填写通知」：{@link AdbPairNotifier#manualAskPair} 发一条带输入框的
+ * 通知，用户在通知栏里照着系统页填配对端口与配对码，由 {@link AdbPairInputReceiver} 接住执行。
+ *
+ * 所以主流程是：点按钮 → 跳系统页 → 无障碍服务（{@link AdbPairAccessibilityService}）
+ * 读屏 + 自动点击 + 后台执行 adb 完成配对与连接 → 进度通过通知（{@link AdbPairNotifier}）
+ * 汇报。用户全程只需点一次按钮，不用看、不用填。
+ *
+ * 按钮按当前状态自适应，用户不用自己判断该配对还是该连接：
+ *   - 从未配对过 → 自动流程从「点进配对页取配对码」开始
+ *   - 已配对过   → 直接读主页端口连接
+ *
+ * 设计要点：
+ *   1. 状态检测在 App 进程内命令式探测（走 {@link AdbCmd#probeConnected}）：在同一次容器
+ *      会话里用记下的端口重连 + adb devices 校验，只认实时事实、不做内存缓存。
+ *      （不能只跑 adb devices —— 容器会话不跨 exec 保留，那样永远看到空列表，界面会一直
+ *      停在「未连接」上，见 {@link AdbCmd} 类注释第 6 条）
+ *   2. 无障碍是自动流程的硬前提：未开启时先引导开启
+ *      （{@link AdbPairAccessibilityService#isEnabled}）；
+ *   3. 自动走不通时的兜底是「可填写通知」（见上）：不需要无障碍、不需要悬浮窗权限，
+ *      用户在通知栏里照抄系统页上的数字即可；
+ *   4. MainActivity.onResume 时调用 {@link #refresh()}，回到主界面即重新检测连接状态，
+ *      并顺带补做「去配对」时因缺权限/未授权而挂起的流程；
+ *   5. 端口一读到手就把用户送回主界面（见 {@link AdbPairAccessibilityService#returnToAppIfReady}），
+ *      配对/连接改在后台跑、结果用 Toast 汇报；结果出来时再调 {@link #refreshActive()}
+ *      补刷一次状态条 —— 否则界面会停在上一步的「未连接」上。
  */
 public final class AdbPairPanel {
 
-    /** Termux 自带 bash 的绝对路径（Runtime.exec 不加载 Termux 环境，需显式指定） */
-    private static final String TERMUX_BASH = "/data/data/duckyal.KaguraX/files/usr/bin/bash";
+    /** SharedPreferences 文件名（App 私有，无需权限；与无障碍自动流程、通知输入共用同一份状态） */
+    public static final String PREFS_NAME = "adb_pair_prefs";
 
-    /** Termux 可执行目录（proot-distro 等命令所在的 PATH 前缀） */
-    private static final String TERMUX_BIN = "/data/data/duckyal.KaguraX/files/usr/bin";
+    /** 是否完成过首次配对 key（决定流程从「取配对码」还是「直接用端口连接」开始） */
+    public static final String KEY_HAS_PAIRED = "has_paired";
 
-    /** Termux 前缀目录（含 lib/tmp 等） */
-    private static final String TERMUX_PREFIX = "/data/data/duckyal.KaguraX/files/usr";
+    /** 最近一次连接成功的端口 key（仅作记录，重连一律以系统页当前显示为准） */
+    public static final String KEY_LAST_CONNECT_PORT = "last_connect_port";
 
-    /** Termux 主目录（bash 的 HOME） */
-    private static final String TERMUX_HOME = "/data/data/duckyal.KaguraX/files/home";
+    /** 通知权限（Android 13+）的 requestCode */
+    private static final int REQUEST_NOTIFICATION_PERM = 1003;
 
-    /** SharedPreferences 文件名（App 私有，无需权限；沿用弹窗版本，旧数据可直接续用） */
-    private static final String PREFS_NAME = "adb_pair_prefs";
+    /** 等无障碍服务连上的总时长（毫秒）：应用进程刚被系统回收时，系统重绑需要一两秒 */
+    private static final long SERVICE_WAIT_MAX_MS = 4000;
 
-    /** 记住的连接地址 key */
-    private static final String KEY_LAST_CONNECT_ADDRESS = "last_connect_address";
+    /** 等待无障碍服务连上时的轮询间隔（毫秒） */
+    private static final long SERVICE_POLL_MS = 200;
 
-    /** 是否完成过首次配对 key（用于未连接时的引导文案与连接前的配对引导） */
-    private static final String KEY_HAS_PAIRED = "has_paired";
+    /** 日志标签 */
+    private static final String LOG_TAG = "AdbPairPanel";
+
+    /** 系统「设置」的包名：无线调试页在它里面 */
+    private static final String SETTINGS_PACKAGE = "com.android.settings";
 
     /**
-     * 2026-09 修正：Android 11+ 无线调试的「连接端口」并非固定 5555，而是每次开关
-     * 无线调试都会变化的随机端口（被控端设置页实时显示 IP:端口）。所以连接一律按被控端
-     * 当前显示填写：本类只记住上次完整地址以复用 IP，绝不默认补 5555，避免“连不上反复
-     * 开关几次才能好”的假象（端口不对时 connect 会 connection refused）。
+     * 「无线调试」页在各 ROM 上的组件名（按命中率排序）。
+     *
+     * Android 没有公开的 action 能直达这一页 —— 只有 ACTION_APPLICATION_DEVELOPMENT_SETTINGS
+     * 指向「开发者选项」列表，用户还得再点一层。所以只能赌组件名，逐个试：
+     * 类原生与多数 ROM 用 Settings$WifiDebuggingActivity，其余是几个已知变体。
+     * 注意「能解析」不等于「能启动」：部分 ROM 把这些类声明成未导出，
+     * startActivity 会抛 SecurityException，所以每个都得实际试一次（见 openIntent）。
      */
-
-    /** Runtime.exec 等待 adb devices 输出的最长时间（毫秒），防止进程挂起卡死子线程 */
-    private static final long EXEC_TIMEOUT_MS = 20000;
-
-    /** Runtime.exec 等待配对/连接命令的最长时间（毫秒）：adb 网络操作可能稍慢 */
-    private static final long OP_TIMEOUT_MS = 30000;
-
-    /** adb connect 的最大尝试次数（含首次）：配对刚成功后立即 connect 偶发失败，重试兜底 */
-    private static final int MAX_CONNECT_ATTEMPTS = 3;
-
-    /** 两次 connect 尝试之间的间隔（毫秒） */
-    private static final long CONNECT_RETRY_DELAY_MS = 2000;
-
-    /** connect 后等待设备出现在 adb devices 的固定时长（秒，与 connect 同会话内 sleep） */
-    private static final String CONNECT_SETTLE_SLEEP_S = "1.5";
+    private static final String[] WIFI_DEBUGGING_COMPONENTS = {
+            "com.android.settings.Settings$WifiDebuggingActivity",
+            "com.android.settings.Settings$WifiDebuggingSettingsActivity",
+            "com.android.settings.wifi.debugging.WifiDebuggingActivity",
+            "com.android.settings.development.WifiDebuggingActivity",
+    };
 
     /** 状态刷新序号：用于丢弃过期的状态检测结果（避免慢线程覆盖新结果） */
     private int mStatusSeq;
 
-    private final Activity activity;          // 页面 Activity（找控件/跑 UI）
+    /**
+     * 用户被引导去系统设置（悬浮窗权限 / 无障碍授权）时置位：返回后由 {@link #refresh()}
+     * 自动接着往下走，不用让用户自己再点一遍按钮。
+     */
+    private boolean mPendingLaunch;
+
+    /**
+     * 通知权限（Android 13+）结果还没回来、自动流程在等它，见 {@link #startPairingFlow()}。
+     * 不能在申请权限后立刻跳页 —— 权限对话框会被跳转压掉，用户永远授权不了。
+     */
+    private boolean mPendingAutoStart;
+
+    /** 等无障碍服务实例的轮询序号：新一轮点按钮会把它顶掉，避免多轮等待同时往下走 */
+    private int mServiceWaitSeq;
+
+    private final Activity activity;          // 页面 Activity（找控件/跑 UI/跳系统页）
     private final Context appContext;         // Application context（Toast/偏好，防泄漏）
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
+    /**
+     * 当前活着的面板实例，只服务于 {@link #refreshActive()} 一件事。
+     * 用弱引用，页面销毁后不再持有它。
+     */
+    private static WeakReference<AdbPairPanel> sActive;
+
     // 控件引用（activity_main.xml ADB 区块）
     private TextView tvStatus;                // 顶部连接状态
-    private Button btnConnectTab;             // 「连接」切换标题（高亮=当前区块）
-    private Button btnPairTab;                // 「首次配对」切换标题
-    private View layoutConnectSection;        // 日常连接区块（默认显示）
-    private View layoutPairSection;           // 首次配对区块（与连接互斥，默认隐藏）
-    private EditText etPairAddress;           // 配对地址
-    private EditText etPairCode;              // 配对码
-    private Button btnPair;                   // 「配对」按钮
-    private EditText etConnectAddress;        // 连接地址
-    private Button btnConnect;                // 「连接」按钮
+    private Button btnGoPair;                 // 唯一入口：「配对 / 连接」
+    private TextView btnManualPair;           // 手动兜底入口：「自动失败？手动填写」
 
     /**
-     * 构造：绑定主界面 activity_main.xml 中 ADB 区块的全部控件、设置监听并做一次状态检测。
+     * 构造：绑定主界面 ADB 区块的控件、设置监听并做一次状态检测。
      * 必须在 {@code setContentView(R.layout.activity_main)} 之后调用。
      */
     public AdbPairPanel(Activity activity) {
@@ -113,10 +153,34 @@ public final class AdbPairPanel {
 
         bindViews(activity);
         setListeners();
-        loadSavedConnectAddress();
-        prefillPairAddressFromConnect();   // 用上次连接 IP 预填配对地址（仅需补系统显示的端口）
-        showConnectSection();              // 默认只展开「连接」区块（标签高亮同步）
+        sActive = new WeakReference<>(this);
         refresh();                         // 绑定后立即检测一次连接状态
+    }
+
+    /**
+     * 页面销毁时解绑（由 MainActivity.onDestroy 调用）：
+     * 配对结果是由无障碍服务 / 通知输入接收者异步回报的，页面没了就不能再往它身上刷状态。
+     */
+    public void detach() {
+        AdbPairPanel current = sActive == null ? null : sActive.get();
+        if (current == this) {
+            sActive = null;
+        }
+    }
+
+    /**
+     * 供无障碍自动流程 / 通知输入接收者调用：配对（连接）在后台出结果后，把主界面状态条刷一遍。
+     *
+     * 为什么需要它：现在「端口一读到就回 App」，onResume 里那次 refresh() 跑在 adb 结果之前，
+     * 那时状态还是「未连接」；结果回来若不补刷，界面会一直停在错的状态上，直到用户切走再回来。
+     *
+     * 面板不在（页面已销毁 / 从没建过）就静默忽略；可以在任意线程调用。
+     */
+    public static void refreshActive() {
+        AdbPairPanel panel = sActive == null ? null : sActive.get();
+        if (panel != null) {
+            panel.mainHandler.post(panel::refresh);
+        }
     }
 
     // ==================== 绑定与监听 ====================
@@ -124,85 +188,50 @@ public final class AdbPairPanel {
     /** 绑定布局控件（id 与 activity_main.xml ADB 区块一一对应） */
     private void bindViews(Activity activity) {
         tvStatus = activity.findViewById(R.id.tv_adb_status);
-        btnConnectTab = activity.findViewById(R.id.btn_connect_tab);
-        btnPairTab = activity.findViewById(R.id.btn_pair_tab);
-        layoutConnectSection = activity.findViewById(R.id.layout_connect_section);
-        layoutPairSection = activity.findViewById(R.id.layout_pair_section);
-        etPairAddress = activity.findViewById(R.id.et_pair_address);
-        etPairCode = activity.findViewById(R.id.et_pair_code);
-        btnPair = activity.findViewById(R.id.btn_pair);
-        etConnectAddress = activity.findViewById(R.id.et_connect_address);
-        btnConnect = activity.findViewById(R.id.btn_connect);
+        btnGoPair = activity.findViewById(R.id.btn_go_pair);
+        btnManualPair = activity.findViewById(R.id.btn_manual_pair);
     }
 
     /** 设置监听 */
     private void setListeners() {
-        btnConnectTab.setOnClickListener(v -> showConnectSection());
-        btnPairTab.setOnClickListener(v -> showPairSection());
-        btnPair.setOnClickListener(v -> onPairClicked());
-        btnConnect.setOnClickListener(v -> onConnectClicked());
-    }
-
-    // ==================== 互斥区块切换 ====================
-
-    /**
-     * 只展开「连接」区块（日常连接）：收起配对区块，标签高亮同步。
-     * 「连接 / 首次配对」互斥——一次只在页面上显示一个区块，避免页面拥挤。
-     */
-    private void showConnectSection() {
-        layoutConnectSection.setVisibility(View.VISIBLE);
-        layoutPairSection.setVisibility(View.GONE);
-        styleTab(btnConnectTab, true);
-        styleTab(btnPairTab, false);
-    }
-
-    /** 只展开「首次配对」区块：收起连接区块，标签高亮同步 */
-    private void showPairSection() {
-        layoutConnectSection.setVisibility(View.GONE);
-        layoutPairSection.setVisibility(View.VISIBLE);
-        styleTab(btnConnectTab, false);
-        styleTab(btnPairTab, true);
-    }
-
-    /**
-     * 分段控件两段的选中/未选中样式：
-     * 选中=主色实心圆角块（「连接」在左、半圆角向左；「首次配对」在右、半圆角向右），
-     * 未选中=透明。两段始终紧贴在凹槽外壳里，无缝隙、无独立胶囊感。
-     */
-    private void styleTab(Button tab, boolean active) {
-        if (active) {
-            tab.setBackgroundResource(tab == btnConnectTab
-                    ? R.drawable.bg_tab_sel_left : R.drawable.bg_tab_sel_right);
-            // 主题中 colorOnPrimary 恒为白（values / values-night 均 @color/white）
-            tab.setTextColor(Color.WHITE);
-        } else {
-            tab.setBackgroundColor(Color.TRANSPARENT);
-            // colorPrimary 为平台主题属性（主题已 override），凹槽底色上主色文字清晰
-            tab.setTextColor(attrColor(android.R.attr.colorPrimary));
-        }
-    }
-
-    /** 解析当前主题下某 ?attr 颜色属性的实际色值 */
-    private int attrColor(int attrRes) {
-        android.util.TypedValue value = new android.util.TypedValue();
-        activity.getTheme().resolveAttribute(attrRes, value, true);
-        return value.data;
+        btnGoPair.setOnClickListener(v -> startPairingFlow());
+        btnManualPair.setOnClickListener(v -> showManualInput());
     }
 
     // ==================== 状态检测 ====================
 
     /** 页面回到前台（onResume）或配对/连接结束后调用：重新检测一次连接状态 */
     public void refresh() {
+        // 补做被中断的流程：用户从系统设置授权返回后自动继续（详见 resumePendingLaunch）
+        resumePendingLaunch();
+
+        // 顺手把被系统或手机管家摘掉的「配对助手」写回来。这个问题的表现就是「每次进 App 都要
+        // 去无障碍里手动开一遍」，一进界面就自己修好，用户压根不会看到那个引导框。
+        // 只在拿到 WRITE_SECURE_SETTINGS 后才写得动（见 AdbCmd.ensureSelfPermission），
+        // 没拿到时这里会静默失败，不影响后续流程。
+        if (!AdbPairAccessibilityService.isEnabled(activity)) {
+            AdbPairAccessibilityService.tryReEnable(activity);
+        }
+
         tvStatus.setText(R.string.adb_loading);
         final int seq = ++mStatusSeq;
         new Thread(() -> {
             // 子线程：执行命令并解析（可能耗时数秒，绝不能放主线程）
             final boolean initialized = MainActivity.isDebianInitialized();
-            final String connectedDevice = queryConnectedDevice();
+            // 用 probeConnected（同会话重连+校验）而不是裸 adb devices：容器内 adb server
+            // 不跨 exec 保留，裸 devices 恒为空列表，界面会永远显示「未连接」
+            final String connectedDevice = initialized
+                    ? AdbCmd.probeConnected(lastConnectPort())
+                    : null;
             mainHandler.post(() -> {
                 if (seq != mStatusSeq) return;   // 已有更新的检测结果，丢弃本次过期结果
                 updateStatusText(initialized, connectedDevice);
             });
+            // 已经连着（升级后第一次进来往往正是这种状态）就顺手把系统权限补上 —— 这是无障碍
+            // 被系统摘掉后能自己开回来的前提。放在状态刷新之后，免得拖慢界面上的状态显示。
+            if (connectedDevice != null) {
+                AdbCmd.ensureSelfPermission(connectedDevice, appContext);
+            }
         }).start();
     }
 
@@ -211,8 +240,8 @@ public final class AdbPairPanel {
      *
      * 未连接不再只显示干巴巴的「未连接」，而是按上下文给出下一步引导：
      *   - 容器未初始化 → 「容器未初始化」
-     *   - 从未配对过   → 「未连接 · 请先首次配对」
-     *   - 配对过       → 「未连接 · 请点击「连接」」（重连场景）
+     *   - 从未配对过   → 「未连接 · 请先配对」
+     *   - 配对过       → 「未连接 · 请点「配对 / 连接」」（重连场景，多数是端口变了）
      *   - 已连接       → 绿色「已连接：<ip:port>」
      */
     private void updateStatusText(boolean initialized, String connectedDevice) {
@@ -231,470 +260,304 @@ public final class AdbPairPanel {
         }
     }
 
-    /**
-     * 执行 <proot-distro login debian -- adb devices> 并解析出第一个有效设备。
-     *
-     * @return 形如 "192.168.1.100:5555" 的设备地址；未连接/异常返回 null
-     */
-    private String queryConnectedDevice() {
-        String output = execInContainer("devices", EXEC_TIMEOUT_MS);
-        return parseAdbDevices(output);
-    }
-
-    // ==================== 命令执行（沿用原 AdbPairDialog 实现） ====================
+    // ==================== 配对 / 连接入口 ====================
 
     /**
-     * 在 App 进程内静默执行容器内 adb 命令（不打开任何终端）。
+     * 「配对 / 连接」入口：走无障碍全自动流程。
      *
-     * 命令形态：export PATH=<Termux bin> && proot-distro login debian -- adb <adbArgs>
+     * 不再依赖悬浮窗：Android 12 起系统「设置」持有 HIDE_OVERLAY_WINDOWS，会隐藏第三方
+     * 悬浮窗 —— 而端口与配对码只在系统「无线调试」页显示，浮窗在那一页根本看不见。
+     * 现在改成：无障碍读屏 + 自动点击 + 后台执行 adb，进度走通知。
      *
-     * @param adbArgs  adb 子命令及参数，如 "devices"、"pair 1.2.3.4:37015 123456"
-     * @param timeoutMs 最长等待毫秒数，超时强制销毁进程
-     * @return 命令完整输出（stdout+stderr 合并）；容器未初始化/执行异常/超时返回 null
+     * 两道前置检查：
+     *   1. 通知权限（Android 13+）：不授权也能跑完，只是看不到进度，所以只顺手要一次、不阻塞；
+     *   2. 配对助手（无障碍）：没有它读不到系统页上的端口与配对码，这是硬前提，未开启就引导。
      */
-    private String execInContainer(String adbArgs, long timeoutMs) {
+    private void startPairingFlow() {
         if (!MainActivity.isDebianInitialized()) {
-            return null;    // 容器未初始化时直接返回，不浪费时间执行命令
+            toast(R.string.adb_not_initialized);
+            return;
         }
 
-        try {
-            // Runtime.exec 默认 PATH 不包含 Termux 目录，必须显式 export 前缀，
-            // 否则系统找不到 proot-distro 命令。
-            // 另 source ~/proot_env.sh 自愈 proot 运行环境（/system/bin/sh wrapper +
-            // PD_PROOT_BIN），否则 proot-distro 干净环境下 proot 报 CANNOT LINK。
-            String command = "export PATH=" + TERMUX_BIN + ":$PATH && "
-                    + ". " + TERMUX_HOME + "/proot_env.sh 2>/dev/null || true; "
-                    + "proot-distro login debian -- adb " + adbArgs;
+        // 新一轮开始：先把上一轮留着的失败/成功通知收掉。它不会被新进度顶掉（不同 id），
+        // 留着只会让用户分不清哪个结论是这次的。
+        AdbPairNotifier.clearResult(appContext);
 
-            ProcessBuilder pb = new ProcessBuilder(TERMUX_BASH, "-c", command);
-            pb.redirectErrorStream(true);   // 把 stderr 并入 stdout，避免只读一个流导致管道阻塞死锁
-
-            // 关键：App 进程环境（zygote 继承）没有 Termux 的 LD_LIBRARY_PATH 及
-            // proot-distro 必需的环境变量。缺 LD_LIBRARY_PATH 时 bash/python/proot
-            // 全部 CANNOT LINK；缺 TERMUX_APP__PACKAGE_NAME/TERMUX__PREFIX 时
-            // proot-distro 回落官方 com.termux 前缀导致路径错乱、登录失败。
-            // 症状：配对/连接点了没反应（命令静默失败/超时）。
-            // 此处与 TermuxShellEnvironment（termux-shared）注入的变量保持一致。
-            Map<String, String> env = pb.environment();
-            env.put("HOME", TERMUX_HOME);
-            env.put("PREFIX", TERMUX_PREFIX);
-            env.put("TERM", "dumb");
-            env.put("LD_LIBRARY_PATH", TERMUX_PREFIX + "/lib");
-            env.put("TERMUX_APP__PACKAGE_NAME", "duckyal.KaguraX");
-            env.put("TERMUX__PREFIX", TERMUX_PREFIX);
-            env.put("TERMUX_APP__DATA_DIR", "/data/data/duckyal.KaguraX");
-            env.put("TERMUX_APP__LEGACY_DATA_DIR", "/data/data/duckyal.KaguraX");
-            env.put("PROOT_TMP_DIR", TERMUX_PREFIX + "/tmp");
-
-            Process process = pb.start();
-
-            // 先等待进程结束（带超时强制销毁），再读输出。
-            // 顺序很关键：若先 readLine 再 waitForProcess，命令卡住时 readLine 会一直阻塞，
-            // 超时保护根本执行不到 → 子线程永久挂起、按钮永远禁用、无任何 Toast
-            // （表现为「点了配对没反应」）。先 wait 后 read 则卡住也能超时返回。
-            waitForProcess(process, timeoutMs);
-
-            // 进程已结束（或已销毁），readLine 立即读到 EOF；销毁前已写入管道的输出仍可读出
-            StringBuilder output = new StringBuilder();
-            try (BufferedReader reader = new BufferedReader(
-                    new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    output.append(line).append('\n');
-                }
-            }
-            return output.toString();
-        } catch (Exception e) {
-            return null;    // 命令不存在 / IO 异常等：按失败处理
+        // 通知权限（Android 13+）先要、并且等结果回来再跳页：
+        // 立刻跳页的话权限对话框会被压掉，用户看到了也点不了（详见 onRequestPermissionsResult）
+        if (needNotificationPermission()) {
+            mPendingAutoStart = true;
+            ActivityCompat.requestPermissions(activity,
+                    new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQUEST_NOTIFICATION_PERM);
+            return;
         }
+        continuePairingFlow();
     }
 
     /**
-     * 等待进程结束（兼容 API 24：不用 waitFor(long, TimeUnit)，改轮询）。
-     * 超过超时时间直接销毁进程，避免子线程永久卡死。
+     * 权限结果回调（由 MainActivity 转发）。
+     * 无论授权还是拒绝都继续往下走 —— 拒绝只是看不到通知进度，配对本身照样能在后台完成。
      */
-    private void waitForProcess(Process process, long timeoutMs) throws InterruptedException {
-        long deadline = System.currentTimeMillis() + timeoutMs;
-        while (System.currentTimeMillis() < deadline) {
-            try {
-                process.exitValue();    // 进程已结束时返回退出码，否则抛 IllegalThreadStateException
-                return;
-            } catch (IllegalThreadStateException e) {
-                Thread.sleep(200);      // 进程还在运行，休眠后继续轮询
-            }
+    public void onRequestPermissionsResult(int requestCode) {
+        if (requestCode != REQUEST_NOTIFICATION_PERM || !mPendingAutoStart) return;
+        mPendingAutoStart = false;
+        continuePairingFlow();
+    }
+
+    /** 真正的流程起点：检查无障碍（自动流程的硬前提）→ 启动自动流程 + 跳系统页 */
+    private void continuePairingFlow() {
+        if (!AdbPairAccessibilityService.isEnabled(activity)
+                && !AdbPairAccessibilityService.tryReEnable(activity)) {
+            // 自己写不回去（多半是没授 WRITE_SECURE_SETTINGS）：照旧引导用户去系统设置手动开
+            mPendingLaunch = true;
+            showAccessibilityGuideDialog();
+            return;
         }
-        process.destroy();              // 超时：强制结束
+        if (AdbPairAccessibilityService.isAutoReady()) {
+            launchAutoPairing();
+            return;
+        }
+        // 无障碍在系统里是开着的，只是服务实例还没连上 —— 最常见于应用进程刚被系统回收过：
+        // 系统会重新绑定服务，只差一两秒。这里自己等一下，别让用户再点一次
+        // （看到「还没就绪」多半会以为得去系统里重新开一遍无障碍，白跑一趟设置）。
+        waitForServiceThenLaunch(SERVICE_WAIT_MAX_MS);
     }
 
     /**
-     * 解析 adb devices 输出，找第一台状态为 device 的设备。
+     * 等无障碍服务连上再继续：连上了往下走，等超时才提示用户。
      *
-     * 规则：第二列必须精确等于 device（offline/unauthorized 不算）；
-     * 标题行 "List of devices attached" 第二列是 "of"，天然被排除。
+     * 为什么要等：服务实例（{@code sInstance}）要等系统绑定完成才非空。用户刚从后台把应用
+     * 调回来、或刚在系统设置里开启无障碍时，这个空窗期真实存在 —— 不等的话用户会以为白开了。
      */
-    private String parseAdbDevices(String output) {
-        if (output == null) return null;
-        for (String line : output.split("\n")) {
-            String trimmed = line.trim();
-            if (trimmed.isEmpty()) {
-                continue;
-            }
-            String[] parts = trimmed.split("\\s+");
-            if (parts.length >= 2 && "device".equals(parts[1])) {
-                return parts[0];    // 返回第一台有效设备
-            }
+    private void waitForServiceThenLaunch(long remainingMs) {
+        if (AdbPairAccessibilityService.isAutoReady()) {
+            launchAutoPairing();
+            return;
         }
-        return null;
+        if (remainingMs <= 0) {
+            toast(R.string.adb_auto_not_ready);
+            return;
+        }
+        final int seq = ++mServiceWaitSeq;
+        mainHandler.postDelayed(() -> {
+            if (seq != mServiceWaitSeq) return;   // 这轮等待已被新的一次点按钮取代
+            waitForServiceThenLaunch(remainingMs - SERVICE_POLL_MS);
+        }, SERVICE_POLL_MS);
+    }
+
+    /** 启动无障碍自动流程 + 跳系统「无线调试」页（顺序：先开始监听，再跳页） */
+    private void launchAutoPairing() {
+        // 开发者选项还没开时，这一步的职责只是引导用户去开（跳「关于手机」连点版本号）。
+        // 此时**不能**启动自动流程：无障碍服务一旦跑起来就会读屏、翻页、点击，
+        // 和用户在「关于手机」页连点版本号的操作直接打架，还会把那一页翻得乱七八糟。
+        // 引导完就交给用户自己操作，开好后回 App 再点一次按钮即可走完整自动流程。
+        if (!isDevelopmentSettingsEnabled()) {
+            launchWirelessDebuggingPage(false);   // 内部弹引导框，并跳「关于手机」
+            return;
+        }
+
+        AdbPairAccessibilityService.startAuto(!hasPaired());
+        launchWirelessDebuggingPage(false);
+        toast(R.string.adb_auto_started);
+    }
+
+    /** Android 13+ 是否还缺通知权限（自动流程的进度与失败原因都发在通知栏） */
+    private boolean needNotificationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return false;
+        return ContextCompat.checkSelfPermission(activity, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED;
     }
 
     /**
-     * 在 adb 命令输出中查找指定序列号(ip:port)所在行并返回其状态。
-     * 未出现在输出中返回 null。
+     * 配对助手（无障碍）未开启时的引导。
      *
-     * 说明：performConnect 的复合命令把 adb connect 与 adb devices 放同一段输出里，
-     * 此处直接解析即可，无需另开一次 exec（避免 adb server daemon 会话漂移）。
+     * 自动流程完全依赖它（端口与配对码只在系统页上，只能读屏），所以这是硬前提；
+     * 但仍留「手动填写」这个出口：不想开无障碍时，改从通知栏照抄系统页上的数字。
      */
-    private String deviceStateOf(String output, String address) {
-        if (output == null) return null;
-        for (String line : output.split("\n")) {
-            String[] parts = line.trim().split("\\s+");
-            if (parts.length >= 2 && address.equals(parts[0])) {
-                return parts[1];
-            }
-        }
-        return null;
+    private void showAccessibilityGuideDialog() {
+        new AlertDialog.Builder(activity)
+                .setTitle(R.string.adb_accessibility_guide_title)
+                .setMessage(R.string.adb_accessibility_guide_message)
+                .setPositiveButton(R.string.adb_accessibility_guide_go, (d, w) -> {
+                    // 去开无障碍：回来后由 refresh() → resumePendingLaunch() 自动接着走
+                    mPendingLaunch = true;
+                    AdbPairAccessibilityService.openSettings(activity);
+                })
+                .setNegativeButton(R.string.adb_accessibility_guide_skip, (d, w) -> showManualInput())
+                .show();
     }
 
     /**
-     * 判断命令输出是否命中任一成功标志（大小写不敏感）。
+     * 手动兜底：把输入框发到通知栏，由用户照系统页自己填。
+     *
+     * 为什么不是浮窗：Android 12 起系统「设置」持有 HIDE_OVERLAY_WINDOWS，会隐藏第三方
+     * TYPE_APPLICATION_OVERLAY 窗口 —— 浮窗在「无线调试」页上根本不可见，那条路已作废。
+     * 通知栏不受该限制（它是 SystemUI），配 RemoteInput 就能直接在里面输入，
+     * 详见 {@link AdbPairInputReceiver}。
+     *
+     * 从哪一步起步看配对状态，与自动流程的分流保持一致（{@code startAuto(!hasPaired())}）：
+     *   · 没配对过 / 认证已失效 —— 先填「配对端口 + 配对码」；
+     *   · 已配对过 —— 只要「连接端口」：配对码早用不上了，没必要逼用户再抄一遍。
+     * 万一认证其实已经失效也不会卡住：连接失败会被判成 needsRePair，通知原地换成配对输入
+     * （见 {@link AdbPairInputReceiver#handleConnect}）。
      */
-    private boolean isSuccess(String output, String... markers) {
-        if (output == null) return false;
-        String lower = output.toLowerCase();
-        for (String marker : markers) {
-            if (lower.contains(marker.toLowerCase())) return true;
+    private void showManualInput() {
+        mPendingLaunch = false;
+        // 手动接管前先停掉自动流程：它还在读屏/自动点击的话，会和用户手填的数打架
+        AdbPairAccessibilityService.cancelAuto();
+
+        // 先发通知、再跳系统页：跳页会把本应用切到后台，输入框必须在那之前就位，
+        // 顺序反了就会出现「人都站到系统页上了，通知还没发出来」的空窗。
+        if (hasPaired()) {
+            AdbPairNotifier.manualAskConnectPort(appContext, false);
+        } else {
+            AdbPairNotifier.manualAskPair(appContext);
+        }
+        Toast.makeText(appContext, R.string.adb_manual_posted, Toast.LENGTH_LONG).show();
+
+        // 手动流程也得把人送到系统页去：端口和配对码只在「无线调试」页上显示，让用户自己翻
+        // 设置一层层找是白费功夫 —— 自动流程怎么跳，这里就怎么跳（manual=true 只改提示语）。
+        launchWirelessDebuggingPage(true);
+    }
+
+    /**
+     * 用户去系统「无障碍」授权返回后（onResume → refresh），自动接着走自动流程。
+     * 前置条件仍未满足（无障碍还是没开）时保持挂起，不重复弹窗打扰。
+     */
+    private void resumePendingLaunch() {
+        if (!mPendingLaunch) return;
+        if (!AdbPairAccessibilityService.isEnabled(activity)) {
+            return;     // 还是没开：保持 pending，等真正开启后再继续
+        }
+        mPendingLaunch = false;
+        // 刚在系统设置里开启时，服务还要一两秒才连得上，等一下再走（否则用户以为白开了）
+        waitForServiceThenLaunch(SERVICE_WAIT_MAX_MS);
+    }
+
+    /**
+     * 跳到系统「无线调试」页面。
+     *
+     * 系统没有公开的「无线调试」Intent action，各 ROM 也不统一，所以按可靠性依次尝试：
+     *   1. 部分 ROM 提供的 pairing action（能直达「使用配对码配对设备」）
+     *   2. AOSP Settings 的无线调试页组件名（类原生与多数 ROM 沿用同一个组件）
+     *   3. 退到开发者选项首页（用户再点一下「无线调试」）
+     * 跳转前先探开发者选项是否开启：没开就引导怎么开，而不是跳一个空白/不存在的页面。
+     *
+     * @param manual 是否来自手动填写流程（那条路上无障碍已经被停掉）。差别只在一处提示语：
+     *               退到开发者选项列表页时，自动流程能靠无障碍在 1 秒内自己点进「无线调试」，
+     *               手动流程没有它，得让用户自己点 —— 所以不能沿用「会自动进去」的说法。
+     */
+    private void launchWirelessDebuggingPage(boolean manual) {
+        if (!isDevelopmentSettingsEnabled()) {
+            showDevOptionsOffDialog();
+            return;
+        }
+        if (openWirelessDebuggingPage()) {
+            // 手动流程不在这里再报一次：上面那条 adb_manual_posted 已经把「下拉通知栏点回复填写」
+            // 交代完了，页面也确实就在眼前，再叠一条只会排在它后面刷屏
+            if (!manual) toast(R.string.adb_auto_page_ready);
+            return;
+        }
+        // 直达不到就退到开发者选项列表页 —— 但这不是终点：「配对助手」会在 1 秒内自动点进
+        // 「无线调试」（见 AdbPairAccessibilityService.clickWirelessDebuggingEntry），
+        // 所以自动流程的提示语要说清「会自己走」，而不是让用户手动点
+        if (openIntent(new Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))) {
+            Toast.makeText(appContext,
+                    manual ? R.string.adb_manual_dev_options_fallback
+                            : R.string.adb_auto_dev_options_fallback,
+                    Toast.LENGTH_LONG).show();
+            return;
+        }
+        // 最后兜底：系统设置首页
+        openIntent(new Intent(Settings.ACTION_SETTINGS));
+    }
+
+    /** 逐级尝试打开无线调试页；任一成功即返回 true */
+    private boolean openWirelessDebuggingPage() {
+        // 1) 少数 ROM 提供的直达配对页 action（不存在时会抛异常，被 openIntent 吞掉）
+        if (openIntent(new Intent("android.settings.WIRELESS_DEBUGGING_PAIRING"))) {
+            Log.i(LOG_TAG, "直达无线调试页：WIRELESS_DEBUGGING_PAIRING");
+            return true;
+        }
+        // 2) 各 ROM 的无线调试页组件名，逐个试
+        for (String className : WIFI_DEBUGGING_COMPONENTS) {
+            Intent intent = new Intent();
+            intent.setComponent(new ComponentName(SETTINGS_PACKAGE, className));
+            if (!canResolve(intent)) continue;   // 这个 ROM 上没这个类：跳过，别白走一趟异常路径
+            if (openIntent(intent)) {
+                Log.i(LOG_TAG, "直达无线调试页：" + className);
+                return true;
+            }
+            // 类存在但启不动：多半被 ROM 声明成未导出，继续试下一个变体
+            Log.w(LOG_TAG, "该组件无法外部启动：" + className);
         }
         return false;
     }
 
-    /** 从命令输出中提取用于提示的错误详情：取第一个非空、非 adb 常规提示的行。 */
-    private String extractErrorDetail(String output) {
-        if (output == null) return null;
-        for (String line : output.split("\n")) {
-            String trimmed = line.trim();
-            if (trimmed.isEmpty()) continue;
-            if (trimmed.startsWith("*")) continue;   // 跳过 "* daemon not running" 等常规提示
-            return trimmed;
-        }
-        return null;
-    }
-
-    // ==================== 首次配对 ====================
-
     /**
-     * 点击「配对」：App 进程内后台静默执行 adb pair，Toast 反馈结果。
-     *
-     * 配对成功后自动把同一设备的 IP 预填到连接地址框并发起连接（一步到位）。
-     * 配对地址/配对码每次都会变化，一律不保存。
+     * 组件能否被解析到。
+     * 注意：能解析不等于能启动 —— 解析不检查 exported，未导出的类要到 startActivity 时才抛异常，
+     * 所以这里只用来过滤「类根本不存在」的情况。
      */
-    private void onPairClicked() {
-        String pairAddress = etPairAddress.getText().toString().trim();
-        String pairCode = etPairCode.getText().toString().trim();
-
-        if (pairAddress.isEmpty() || pairCode.isEmpty()) {
-            toast(R.string.adb_input_empty_pair);
-            return;
+    private boolean canResolve(Intent intent) {
+        try {
+            return activity.getPackageManager().resolveActivity(intent, 0) != null;
+        } catch (Exception e) {
+            return false;
         }
-        if (!MainActivity.isDebianInitialized()) {
-            toast(R.string.adb_not_initialized);
-            return;
-        }
-
-        btnPair.setEnabled(false);
-        toast(R.string.adb_pair_running);
-
-        new Thread(() -> {
-            // 地址是 ip:port、配对码是纯数字，无 shell 特殊字符，可安全拼接
-            String output = execInContainer("pair " + pairAddress + " " + pairCode, OP_TIMEOUT_MS);
-            // Android 13+ adb pair 成功输出固定含 "Successfully paired"
-            final boolean success = isSuccess(output, "Successfully paired");
-            mainHandler.post(() -> {
-                btnPair.setEnabled(true);
-                if (success) {
-                    setHasPaired(true);   // 记录已完成首次配对，后续连接不再反复引导
-                    prefillConnectAddressFromPair(pairAddress);
-                    showConnectSection();
-                    // 连接端口需按被控端「无线调试」页当前显示填写：若连接框已带端口
-                    // （例如之前记住过同 IP 的端口）则自动连接；否则提示补全新端口。
-                    String connectAddress = etConnectAddress.getText().toString().trim();
-                    if (hasConnectPort(connectAddress)) {
-                        toast(R.string.adb_pair_success);   // 「配对成功，正在自动连接…」
-                        performConnect(connectAddress);
-                    } else {
-                        toast(R.string.adb_pair_success_fill_port);
-                    }
-                } else {
-                    toast(R.string.adb_pair_failed);
-                    refresh();            // 失败也重新检测一次状态
-                }
-            });
-        }).start();
     }
 
     /**
-     * 从配对地址提取 IP，预填到连接地址框（保留 "ip:" 等待用户补系统当前显示的端口）。
-     * 若连接框里已有同一 IP 的完整地址（如上次记住的端口仍有效），则保留不动，便于
-     * 配对成功后直接自动连接。
+     * 开发者选项是否已开启。
+     * 读不到（个别 ROM 限读该 Settings.Global 项）时按「已开启」处理，不拦着用户走后面的跳转尝试。
      */
-    private void prefillConnectAddressFromPair(String pairAddress) {
-        String host = pairAddress;
-        int lastColon = host.lastIndexOf(':');
-        if (lastColon > 0) {
-            host = host.substring(0, lastColon);
-        }
-        String current = etConnectAddress.getText().toString().trim();
-        if (current.isEmpty() || !host.equals(ipOf(current))) {
-            // 不保存残缺地址：记忆只存完整 ip:port，避免下次启动显示 "ip:" 占位
-            etConnectAddress.setText(host + ":");
+    private boolean isDevelopmentSettingsEnabled() {
+        try {
+            return Settings.Global.getInt(activity.getContentResolver(),
+                    Settings.Global.DEVELOPMENT_SETTINGS_ENABLED, 0) == 1;
+        } catch (Exception e) {
+            return true;
         }
     }
 
-    // ==================== 连接 ====================
-
-    /**
-     * 点击「连接」：App 进程内后台静默执行 adb connect，Toast 反馈结果，并记住该地址。
-     */
-    private void onConnectClicked() {
-        String connectAddress = etConnectAddress.getText().toString().trim();
-
-        if (connectAddress.isEmpty()) {
-            toast(R.string.adb_input_empty_connect);
-            return;
-        }
-        // 连接地址必须带端口（被控端无线调试页当前显示的随机端口），缺端口一定连不上
-        if (!hasConnectPort(connectAddress)) {
-            toast(R.string.adb_input_need_port);
-            return;
-        }
-        if (!MainActivity.isDebianInitialized()) {
-            toast(R.string.adb_not_initialized);
-            return;
-        }
-        // 从未完成过首次配对：引导用户先配对（无线调试必须先 pair 一次才能 connect）
-        if (!hasPaired()) {
-            toast(R.string.adb_need_pair_first);
-            showPairSection();    // 自动切到「首次配对」区块（互斥：连接区块收起）
-            return;
-        }
-
-        // 连接成功后记忆（performConnect 成功分支保存），失败不覆盖，避免记住坏端口
-        toast(R.string.adb_connect_running);
-        performConnect(connectAddress);
+    /** 开发者选项未开启：说明开启步骤，并提供一键去「关于手机」（连点版本号 7 次） */
+    private void showDevOptionsOffDialog() {
+        new AlertDialog.Builder(activity)
+                .setTitle(R.string.adb_pair_dev_options_off_title)
+                .setMessage(R.string.adb_pair_dev_options_off_message)
+                .setPositiveButton(R.string.adb_pair_dev_options_go, (d, w) ->
+                        openIntent(new Intent(Settings.ACTION_DEVICE_INFO_SETTINGS)))
+                .setNegativeButton(R.string.adb_pair_later, null)
+                .show();
     }
 
-    /**
-     * 后台静默执行 adb connect，结束后 Toast 结果并刷新状态。
-     * 手动点「连接」与配对成功后的自动连接共用此方法。
-     *
-     * 2026-09 加固（针对“反复开关无线调试才连得上”）：
-     *  1) 重试前先 adb disconnect 同一地址，清掉 adb server 里残留的 offline /
-     *     unauthorized 旧连接，让下次 connect 重新完整握手（避免旧状态导致误判）；
-     *  2) 失败时按 adb 输出分类提示：unauthorized=被控端需点「允许USB调试」/重新配对，
-     *     refused=端口写错或无线调试已关，offline=稍候重连等，直接告诉用户该做什么，
-     *     不再只回显英文原文；
-     *  3) 认证类失败(unauthorized / failed to authenticate)说明上次配对已失效，自动清
-     *     掉配对标记、切回「首次配对」区块并按当前 IP 预填，引导重新配对。
-     *
-     * 2026-09 追加修复（假连接成功）：adb connect 回 "connected to" 只代表 TCP+adb 握手
-     * 建立，不代表设备可用——Android 11+ 无线调试下 host 公钥未授权（设备状态
-     * unauthorized，被控端应弹授权）或 transport 尚未被 adb server 纳管时，connect 同样
-     * 回 "connected to"。故 connect 文本成功不再直接判成功，而是与 adb devices 验证放在
-     * 同一次容器会话内执行，以该地址的真实状态为准：device=真成功；unauthorized=提示去
-     * 被控端点「允许」；offline/查无此设备=先 disconnect 再重试，不再误报「连接成功」。
-     */
-    private void performConnect(String connectAddress) {
-        btnConnect.setEnabled(false);
-
-        new Thread(() -> {
-            String output = null;
-            String verifiedState = null;   // adb devices 中该地址的真实状态：device/unauthorized/其他
-            boolean success = false;
-            for (int attempt = 1; attempt <= MAX_CONNECT_ATTEMPTS && !success; attempt++) {
-                // connect 与 devices 验证放同一次容器会话内顺序执行：规避 adb server daemon
-                // 在两次 exec 之间被杀/漂移（新旧 daemon 各自查不到对方建的 transport）导致
-                // connect 文本成功但 devices 里永远没有该设备的假象。
-                // connect 成功标志含 "connected to"；已连接过则含 "already connected"。
-                output = execInContainer("connect " + connectAddress + "; sleep "
-                        + CONNECT_SETTLE_SLEEP_S + "; adb devices", OP_TIMEOUT_MS);
-                if (output != null && isSuccess(output, "connected to", "already connected")) {
-                    // 假阳性防护：connect 文本成功≠设备可用（未授权设备也回 "connected to"），
-                    // 必须以 adb devices 里该地址的真实状态为准。
-                    verifiedState = deviceStateOf(output, connectAddress);
-                    if ("device".equals(verifiedState)) {
-                        success = true;
-                        break;
-                    }
-                    if ("unauthorized".equals(verifiedState)) {
-                        break;   // 已握手但被控端未授权：停下等用户在被控端点「允许」，不误报成功
-                    }
-                    // offline / 列表里还没有该地址：transport 未就绪，先断开旧状态再重试
-                }
-                if (!success && attempt < MAX_CONNECT_ATTEMPTS) {
-                    // 断开该地址的旧连接（best-effort），清除残留 offline/unauthorized 状态
-                    execInContainer("disconnect " + connectAddress, EXEC_TIMEOUT_MS);
-                    try {
-                        Thread.sleep(CONNECT_RETRY_DELAY_MS);
-                    } catch (InterruptedException e) {
-                        break;
-                    }
-                }
-            }
-
-            final boolean finalSuccess = success;
-            final boolean finalNeedsAuth = "unauthorized".equals(verifiedState);
-            // connect 文本成功但验证未通过（设备始终没入列表/未就绪）：与真失败分开提示
-            final boolean finalTextSaysConnected = !success
-                    && isSuccess(output, "connected to", "already connected");
-            final String hint = connectHint(output);
-            final boolean needRePair = needsRePair(output);
-            final String detail = extractErrorDetail(output);
-            mainHandler.post(() -> {
-                btnConnect.setEnabled(true);
-                if (finalSuccess) {
-                    saveConnectAddress(connectAddress);   // 成功才覆盖记忆，保证记忆为有效地址
-                    toast(R.string.adb_connect_success);
-                } else if (finalNeedsAuth) {
-                    // 连接已建立但被控端未授权（可能根本没弹授权窗）：按现成文案引导处理，
-                    // 不误报「连接成功」，也不清配对标记（必要时按提示重新配对）
-                    Toast.makeText(appContext, R.string.adb_hint_unauthorized,
-                            Toast.LENGTH_LONG).show();
-                } else if (finalTextSaysConnected) {
-                    // 曾回 connected to 但设备未入列/未转 device：明确告知未真正就绪
-                    Toast.makeText(appContext, R.string.adb_connect_not_ready,
-                            Toast.LENGTH_LONG).show();
-                } else if (hint != null) {
-                    // 分类提示（比英文原文可操作）：
-                    // 认证类失败自动引导重新配对，其余停留在连接区块让用户按提示改
-                    Toast.makeText(appContext, hint, Toast.LENGTH_LONG).show();
-                    if (needRePair) {
-                        setHasPaired(false);              // 配对已失效：下次需重新配对
-                        prefillPairAddressFromConnect();  // 按连接框 IP 预填配对地址
-                        showPairSection();                // 自动切到「首次配对」
-                        etPairCode.setText("");
-                    }
-                } else if (detail != null) {
-                    // 失败且有 adb 实质输出：显示具体原因，方便排查（如 Connection refused）
-                    Toast.makeText(appContext,
-                            appContext.getString(R.string.adb_connect_failed_detail, detail),
-                            Toast.LENGTH_LONG).show();
-                } else {
-                    toast(R.string.adb_connect_failed);
-                }
-                refresh();    // 结束后重新检测连接状态
-            });
-        }).start();
-    }
-
-    /**
-     * 连接地址是否含端口：形如 ip:port / [ipv6]:port，最后一个冒号后必须是纯数字。
-     * 缺端口（如 "192.168.1.100:"）返回 false。
-     */
-    private boolean hasConnectPort(String address) {
-        if (address == null || address.isEmpty()) return false;
-        int lastColon = address.lastIndexOf(':');
-        if (lastColon <= 0 || lastColon == address.length() - 1) return false;
-        return address.substring(lastColon + 1).matches("\\d+");
-    }
-
-    /** 从完整 ip:port 地址中提取 IP（IPv6 也按最后一个冒号切，稳妥） */
-    private String ipOf(String address) {
-        if (address == null) return "";
-        int lastColon = address.lastIndexOf(':');
-        return lastColon > 0 ? address.substring(0, lastColon) : address;
-    }
-
-    /** 按 adb connect 失败输出分类出“该做什么”的可操作提示；无法识别返回 null */
-    private String connectHint(String output) {
-        if (output == null) return null;
-        String lower = output.toLowerCase();
-        if (lower.contains("unauthorized")) {
-            return appContext.getString(R.string.adb_hint_unauthorized);
+    /** 尝试启动一个系统页面；目标不存在/无权限/被 ROM 禁用时返回 false（不抛给调用方） */
+    private boolean openIntent(Intent intent) {
+        try {
+            activity.startActivity(intent);
+            return true;
+        } catch (Exception e) {
+            return false;
         }
-        if (lower.contains("failed to authenticate")
-                || lower.contains("authentication failed")
-                || lower.contains("failed to authenticate to")) {
-            return appContext.getString(R.string.adb_hint_re_authenticate);
-        }
-        if (lower.contains("offline")) {
-            return appContext.getString(R.string.adb_hint_offline);
-        }
-        if (lower.contains("cannot connect") || lower.contains("connection refused")
-                || lower.contains("failed to connect") || lower.contains("timed out")
-                || lower.contains("no route to host") || lower.contains("unable to connect")) {
-            return appContext.getString(R.string.adb_hint_cannot_connect);
-        }
-        return null;
-    }
-
-    /** 认证类失败（unauthorized / 认证失败）说明上次配对已失效，需要重新配对 */
-    private boolean needsRePair(String output) {
-        if (output == null) return false;
-        String lower = output.toLowerCase();
-        return lower.contains("unauthorized")
-                || lower.contains("failed to authenticate")
-                || lower.contains("authentication failed");
     }
 
     // ==================== 小工具 ====================
 
-    /** 从 SharedPreferences 读取上次记住的连接地址并自动填入 */
-    private void loadSavedConnectAddress() {
-        SharedPreferences prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-        String saved = prefs.getString(KEY_LAST_CONNECT_ADDRESS, null);
-        if (saved != null && !saved.isEmpty()) {
-            etConnectAddress.setText(saved);
-        }
-    }
-
-    /** 记住连接地址到 SharedPreferences */
-    private void saveConnectAddress(String connectAddress) {
-        appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                .edit()
-                .putString(KEY_LAST_CONNECT_ADDRESS, connectAddress)
-                .apply();
-    }
-
-    /**
-     * 用上次连接地址的 IP 预填配对地址框（只补 IP，端口留空等用户填系统显示的新端口）。
-     * 连接地址形如 "192.168.1.100:5555"，配对地址形如 "192.168.1.100:37015"，
-     * 两者 IP 相同，预填后用户只需输入系统「无线调试」页面显示的配对端口与配对码。
-     * 仅当配对地址框为空时预填，避免覆盖用户已输入的内容。
-     */
-    private void prefillPairAddressFromConnect() {
-        String connectAddress = etConnectAddress.getText().toString().trim();
-        if (connectAddress.isEmpty()) return;
-        if (!etPairAddress.getText().toString().trim().isEmpty()) return;
-
-        String host = connectAddress;
-        int lastColon = host.lastIndexOf(':');
-        if (lastColon > 0) {
-            host = host.substring(0, lastColon);
-        }
-        etPairAddress.setText(host + ":");
-    }
-
-    /** 是否完成过首次配对 */
+    /** 是否完成过首次配对（与自动流程、通知输入写入的状态同步） */
     private boolean hasPaired() {
         return appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 .getBoolean(KEY_HAS_PAIRED, false);
     }
 
-    /** 记录是否完成过首次配对 */
-    private void setHasPaired(boolean paired) {
-        appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                .edit()
-                .putBoolean(KEY_HAS_PAIRED, paired)
-                .apply();
+    /**
+     * 最近一次连接成功的端口（prefs 记录）；从没连过返回 null。
+     * 供 {@link AdbCmd#probeConnected} 在状态检测时重连用 —— 无线调试的连接端口在同一次
+     * 开关内不变，所以它可以当「当前该连哪儿」的依据；端口变了（关过无线调试）时探测会
+     * 失败并如实显示未连接。
+     */
+    private String lastConnectPort() {
+        return appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getString(KEY_LAST_CONNECT_PORT, null);
     }
 
     /** Toast 快捷方法 */

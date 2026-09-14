@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    冷启动窗背景（Theme.MainActivity 的 android:windowBackground）。
+
+    系统在 Application.onCreate / Activity.onCreate 执行、首帧尚未绘制时，
+    屏幕上画的就是这张图。此前这里是 @color/bg，夜间取 #121212，
+    观感就是"黑屏卡住"且没有任何"在启动"的提示；现在补一个居中品牌图标，
+    让这段等待期看得出是有事在做。drawable-night/ 下另有一份底色的同名副本。
+
+    图标使用 termux-app/art 目录下的品牌 logo（高清版 ic_launcher2.png），
+    按 96dp 目标尺寸生成 mdpi~xxxhdpi 多密度 PNG，避免直接放大 64×64 的
+    logo.png 导致模糊。
+-->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@color/bg" />
+
+    <item
+        android:drawable="@drawable/ic_splash_logo"
+        android:gravity="center" />
+</layer-list>

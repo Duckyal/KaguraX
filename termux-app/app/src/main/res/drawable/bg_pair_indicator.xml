@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  「配对助手」进度提示条的背景。
+
+  由 AdbPairAccessibilityService 用 TYPE_ACCESSIBILITY_OVERLAY 挂成系统级窗口，
+  浮在系统「无线调试」页之上。深色半透明 + 细白描边：系统设置页有深色也有浅色主题，
+  这个配色在两种主题下都够对比度，不会糊在页面上看不出来。
+-->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="#E6232428" />
+    <corners android:radius="14dp" />
+    <stroke
+        android:width="1dp"
+        android:color="#40FFFFFF" />
+</shape>

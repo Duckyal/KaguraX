@@ -159,7 +159,7 @@ class ADB():
 
         # 获取并更新设备分辨率(竖屏状态)
         self.width, self.height = self.d.window_size()
-        self.log(f'设备初始化完成: 宽:{self.width}, 高:{self.height}', 'debug')
+        self.log(f'设备初始化完成: 宽:{self.width}, 高:{self.height}', 'info')
 
     # ============================================================================================
     # u2 连接管理 + 实时手势
@@ -470,21 +470,21 @@ class ADB():
     # API zh-CN
     def 启动应用(self, package_name:str):
         self.d.app_start(package_name)
-        self.log('启动应用:{0}'.format(package_name), 'debug')
+        self.log('启动应用:{0}'.format(package_name), 'info')
         self.重置定时器()
         
     def 关闭应用(self, package_name:str):
         if package_name == 'all':
             self.d.app_stop_all()
-            self.log('关闭全部用户应用', 'debug')
+            self.log('关闭全部用户应用', 'info')
         else:
             self.d.app_stop(package_name)
-            self.log('关闭应用:{0}'.format(package_name), 'debug')
+            self.log('关闭应用:{0}'.format(package_name), 'info')
         self.重置定时器()
                 
     def 息屏(self):
         self.d.screen_off()
-        self.log('已息屏', 'debug')
+        self.log('已息屏', 'info')
         self.重置定时器()
     
     def 截图保存(self, save_path:str=adb_path, x1:float=0, y1:float=0, x2:float=1.0, y2:float=1.0):
@@ -492,7 +492,7 @@ class ADB():
         x1, y1, x2, y2 = int(self.width*x1), int(self.height*y1), int(self.width*x2), int(self.height*y2)
             
         cv2.imwrite(save_path, self.d.screenshot(format='opencv')[y1:y2, x1:x2, :]) # type: ignore
-        self.log('已保存截图到:{0}'.format(save_path), 'debug')
+        self.log('已保存截图到:{0}'.format(save_path), 'info')
         self.重置定时器()
             
     def 获取截图(self, x1:float=0, y1:float=0, x2:float=1.0, y2:float=1.0):
@@ -532,7 +532,7 @@ class ADB():
         X, Y = x, y
         with self._touch_guard():
             self.d.click(X, Y)
-        self.log('简单点击({0}, {1})'.format(X, Y), 'debug')
+        self.log('简单点击({0}, {1})'.format(X, Y), 'info')
         self.重置定时器()
         
     def 点击(self, center_x: int, center_y: int, loc: int, *els):
@@ -547,7 +547,7 @@ class ADB():
                 self.d.touch.down(center_x, center_y)
                 time.sleep(np.random.uniform(0.05, 0.15))
                 self.d.touch.up(center_x, center_y)
-            self.log(f'模拟点击({center_x}, {center_y})', 'debug')
+            self.log(f'模拟点击({center_x}, {center_y})', 'info')
             self.重置定时器()
             return
         
@@ -573,7 +573,7 @@ class ADB():
             time.sleep(np.random.uniform(0.05, 0.15))
             self.d.touch.up(X, Y)
 
-        self.log(f'模拟点击({X}, {Y})', 'debug')
+        self.log(f'模拟点击({X}, {Y})', 'info')
         self.重置定时器()
 
     def 长按(self, x:int, y:int, duration:float=1.5, jitter:float=0.1):
@@ -586,7 +586,7 @@ class ADB():
             duration += np.random.uniform(-jitter, jitter)
             time.sleep(duration)
             self.d.touch.up(x, y)
-        self.log(f'模拟长按({x}, {y})', 'debug')
+        self.log(f'模拟长按({x}, {y})', 'info')
         self.重置定时器()
 
     def 滑动(self, start_x:int, start_y:int, end_x:int, end_y:int, count:int=30, delay:float=0.01, hold:float=0.0):
@@ -610,7 +610,7 @@ class ADB():
                 time.sleep(delay)
             # 最后：手指抬起
             self.d.touch.up(end_x, end_y)
-        self.log('模拟滑动{0} {1} -> {2} {3}'.format(start_x, start_y, end_x, end_y), 'debug')
+        self.log('模拟滑动{0} {1} -> {2} {3}'.format(start_x, start_y, end_x, end_y), 'info')
         self.重置定时器()
 
     def 滑动轨迹(self, points):
@@ -737,6 +737,7 @@ class ADB():
             return 0
 
         # 并发解码：分批提交，保证两张图之间仍能响应停止指令（与原逐张 check_stop 的可中断性一致）
+        t_start = time.time()
         workers = min(8, max(1, len(images)))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             for start in range(0, len(images), workers):
@@ -751,10 +752,15 @@ class ADB():
                         continue
                     self.cached_templates[img_name] = temp_info
 
-        self.log(f"成功预加载了 {len(self.cached_templates)} 张模板图片。", 'debug')
+        decode_cost = time.time() - t_start
         self.重置定时器()
         # 强制重新计算分辨率适配，确保缩放比例与当前屏幕匹配
         self._adapt_resolution()
+        elapsed = time.time() - t_start
+        # 级别用 info：预加载+适配是任务真正动起来之前最长的一段等待，拆成「解码/适配」
+        # 两段给出耗时，出问题时一眼能看出慢在读图还是慢在分辨率适配（悬浮球气泡只显示 info 级）
+        self.log(f"成功预加载了 {len(self.cached_templates)} 张模板图片"
+                 f"（解码 {decode_cost:.2f}s，适配 {elapsed - decode_cost:.2f}s）", 'info')
         # 返回成功加载的张数（脚本生成器里写的是 n = 图片预加载(...)，此前恒为 None）
         return len(self.cached_templates)
 
@@ -941,6 +947,18 @@ class ADB():
     # 无基准分辨率信息时的默认基准（上传图、数组图、PIL 图都走这里）
     DEFAULT_BASE_RESOLUTION = (1920, 1080)
 
+    # 「画面上没有这批模板」的判据（名义比例验证时的最高匹配分低于此值即认定）。
+    # 阈值由实测定：模板确实在场、只是比例偏 ±15% 时最高分通常 ≥0.8；而画面根本
+    # 没有该内容时，TM_CCOEFF_NORMED 的噪声峰值也能到 0.65（实测 0.6505），故取 0.75。
+    NO_TEMPLATE_SCORE = 0.75
+
+    # 「模板与画面朝向/比例根本不是一回事」的判据：名义缩放两个方向的比值超过此值，
+    # 说明二者连纵横关系都不一致（典型：模板是 16:9 横屏截图，而设备此刻停在
+    # 1080x2460 竖屏上，scale=(0.5625, 2.2778)，skew=4.05）。宽高比失配在全面屏上
+    # 本来就常见（16:9 模板 vs 20.5:9 屏幕 → skew≈1.28），所以阈值放到 2.0，
+    # 只拦「方向级」的离谱情况，保留对真实非均匀拉伸（小窗模式）的搜索能力。
+    SKEW_SKIP_THRESHOLD = 2.0
+
     def _load_template(self, img, img_index, base_resolution=None):
         """
         解码单张模板为灰度图（供 图片预加载 并发调用）。
@@ -1075,11 +1093,17 @@ class ADB():
         一次遍历同时完成两件事：
           1) 统计通过情况，供“当前比例是否可用”的决策（避免旧实现先全量验证、再全量记录算两遍）；
           2) 把 ≥sim 的模板实测尺寸写入 _find_cache（validated），供找图阶段走快速路径。
-        :return: (success, total, total_score)
+        :return: (success, total, total_score, max_score)
+            max_score = 本批模板中的**最高**匹配分（无论过没过阈值）。调用方靠它区分
+            「验证失败」的两种截然不同的成因：
+              · max_score 很低 → 画面上压根没有这批模板（预加载时最常见：模板所在
+                界面还没打开），此时搜修正因子只是在噪声上挑最优，纯浪费；
+              · max_score 接近阈值 → 模板在场、只是比例略偏，这才值得搜修正因子。
         """
         success = 0
         total = 0
         total_score = 0.0
+        max_score = 0.0
         base_w, base_h = self.DEFAULT_BASE_RESOLUTION
         for img_name in test_images:
             temp = self.cached_templates.get(img_name)
@@ -1099,13 +1123,15 @@ class ADB():
             resized = self._resize_to_target(temp['img'], tw, th)
             result = cv2.matchTemplate(main_gray, resized, cv2.TM_CCOEFF_NORMED)
             _, max_val, _, _ = cv2.minMaxLoc(result)
+            if max_val > max_score:
+                max_score = max_val
             if max_val >= sim:
                 success += 1
                 total_score += max_val
                 if record:
                     self._find_cache[img_name] = {'x': None, 'y': None, 'w': tw, 'h': th,
                                                   'validated': True, 'miss': 0}
-        return success, total, total_score
+        return success, total, total_score, max_score
 
     def _sample_images(self, images, limit=5):
         """
@@ -1483,7 +1509,7 @@ class ADB():
         test_images = [target_image] if target_image else list(self.cached_templates.keys())
 
         # 2) 名义比例验证 + 全量记录实测尺寸（一次遍历同时完成两件事）
-        success_count, total_count, total_score = self._verify_templates(
+        success_count, total_count, total_score, max_score = self._verify_templates(
             sim, test_images, main_gray, w_main, h_main, record=True)
         if total_count == 0:
             if self.mode == "more":
@@ -1499,13 +1525,42 @@ class ADB():
             self._scale_correction = (1.0, 1.0)
             return True
 
+        # 走到这里说明名义比例验证没过。但「没过」有两种完全不同的原因，修正因子搜索
+        # 只对其中一种有意义，另一种纯属烧算力（代价是「≤5 张采样 × 14 组」次全屏
+        # matchTemplate，手机上实测几十秒 —— 正是「任务启动要等一分钟」的主因）：
+
+        # 原因一：模板与画面朝向/比例根本不是一回事（如竖屏时预加载横屏游戏模板）。
+        # 修正因子只能在「等比」或「单独 y」两个方向做 ±15% 微调，覆盖不了这种差异。
+        ref = next((t for t in self.cached_templates.values()
+                    if t.get('scale_nominal_x') and t.get('scale_nominal_y')), None)
+        if ref:
+            sx, sy = ref['scale_nominal_x'], ref['scale_nominal_y']
+            skew = max(sx / sy, sy / sx) if sx > 0 and sy > 0 else 1.0
+            if skew >= self.SKEW_SKIP_THRESHOLD:
+                if self.mode == "more":
+                    self.log(f"模板与画面比例相差 {skew:.2f} 倍（scale={sx:.4f},{sy:.4f}），"
+                             f"修正因子覆盖不到，按名义比例直接使用", 'debug')
+                self._scale_correction = (1.0, 1.0)
+                return True
+
+        # 原因二：画面上根本没有这批模板（预加载时最常见——模板所在界面还没打开）。
+        # 此时搜索只是在噪声里挑最大值：实测连"答案"都是 0 命中。
+        if max_score < self.NO_TEMPLATE_SCORE:
+            if self.mode == "more":
+                self.log(f"当前画面未见模板（最高分 {max_score:.3f}），按名义比例直接使用，"
+                         f"跳过修正因子搜索", 'debug')
+            self._scale_correction = (1.0, 1.0)
+            return True
+
         if self.mode == "more":
             self.log("名义比例验证失败，搜索全局修正因子...", 'debug')
 
         # 3) 跨分组采样，搜索全局修正因子
-        sample = self._sample_images(test_images, limit=5)
+        # 采样降到 3 张：命中一组的判定只要"有图过阈值"，3 张足以反映比例是否偏，
+        # 而代价从每组 5 次全屏匹配降到 3 次（最坏 14 组时省下 28 次）
+        sample = self._sample_images(test_images, limit=3)
         if not sample:
-            sample = test_images[:5]
+            sample = test_images[:3]
 
         def _eval(cx, cy):
             """在采样集上评估一组修正因子，返回 (成功张数, 累计相似度)"""
@@ -1561,7 +1616,7 @@ class ADB():
 
         # 4) 应用修正因子重算每张模板的缩放比，并重新记录实测尺寸
         self._compute_template_scales(screenshot_w, screenshot_h, best_cx, best_cy)
-        success_count, total_count, total_score = self._verify_templates(
+        success_count, total_count, total_score, _max_score = self._verify_templates(
             sim, test_images, main_gray, w_main, h_main,
             correction_x=best_cx, correction_y=best_cy, record=True)
 

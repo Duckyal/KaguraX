@@ -80,12 +80,16 @@ import java.util.List;
  *   球态展示后自动收起成线：空闲 5s，任务运行中 1s（用户要求「任务状态 1s 隐藏」）。
  *   摇一摇手机也可直接唤回球态（游戏时不用瞄准那条细线）。
  *
- * 关键：所有悬浮窗（球/线、遥控小窗、日志气泡）都带 {@code FLAG_SECURE}。
- *   该 flag 让窗口不参与系统截图/录屏的捕获（SurfaceFlinger 合成时跳过该层），
- *   于是截图里该位置露出的是底层游戏画面，模板匹配 / OCR 完全不受遮挡影响；
- *   而用户肉眼看到的内容不受任何影响（这是银行 App / DRM 播放器防截屏的同一机制）。
- *   注意：不能依赖系统 Toast 来做日志气泡——Toast 的窗口由系统进程构造，
- *   应用侧无法给它加 flag，必然进截图，所以气泡是自绘的 overlay 窗口。
+ * 悬浮窗不能污染找图输入，这里用的是「按需挂载」而不是 {@code FLAG_SECURE}：
+ *   实测 Android 14（SDK 34）：FLAG_SECURE 并不会让该层从截图里消失 —— SurfaceFlinger
+ *   捕获时把它渲染成一块不透明黑矩形，且窗口内容 GONE（遥控小窗已收起）时黑块照样在，
+ *   比原本的彩色面板更干扰模板匹配。所以：
+ *     - 悬浮球（用户要一直看到）：不带 flag，正常进截图；任务运行时 1s 自动收成线，
+ *       占屏仅 33×154 px 且贴边，对找图影响可忽略；
+ *     - 遥控小窗 / 日志气泡：显示时 addView、隐藏时 removeView，收起后彻底不留 layer，
+ *       截图里既不遮挡也不留黑块。
+ *   注意：不能用系统 Toast 做日志气泡 —— Toast 由系统进程构造，应用无法卸载它，
+ *   必然进截图，所以气泡是自绘的 overlay 窗口。
  *
  * 实现要点：
  *   - 前台服务 + 常驻通知，保证在游戏内不被回收；
@@ -326,7 +330,9 @@ public class FloatingWindowService extends Service {
      * 创建悬浮球窗口：顶层容器 = 球态内容（光环 + 图标） + 线态内容（细线），
      * 两者按 {@link #mBallCollapsed} 切换可见性，窗口尺寸随之变化。
      *
-     * 窗口带 FLAG_SECURE：不进入系统截图/录屏，因此悬浮球不会污染找图找字的输入。
+     * 悬浮球常驻可见（用户要一直看到它），因此不能加 FLAG_SECURE —— 加了会在截图里
+     * 变成一块黑矩形（Android 14 实测），反而污染找图。它靠「任务运行时 1s 自动收成
+     * 贴边细线」把占屏面积压到最小（33×154 px）来降低对匹配的影响。
      */
     private void createBall(int screenW, int screenH) {
         int ballSize = dp(BALL_SIZE_DP);
@@ -377,10 +383,10 @@ public class FloatingWindowService extends Service {
         mBallParams = new WindowManager.LayoutParams(
                 box, box,
                 overlayType(),
+                // 不能加 FLAG_SECURE：Android 14 上它会被截图渲染成黑块（见类注释实测说明），
+                // 反而污染找图。球/线本就贴边且任务运行时自动收成线，直接让它进截图更安全。
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-                        // 关键：悬浮窗不参与系统截图/录屏捕获，截图里露出底层游戏画面
-                        | WindowManager.LayoutParams.FLAG_SECURE,
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT);
         mBallParams.gravity = Gravity.TOP | Gravity.START;
 
@@ -817,7 +823,7 @@ public class FloatingWindowService extends Service {
 
     // ==================== 日志气泡 ====================
 
-    /** 创建日志气泡：自绘的胶囊文本窗，带 FLAG_SECURE 且不可触摸（绝不拦游戏点击） */
+    /** 创建日志气泡：自绘的胶囊文本窗，不可触摸（绝不拦游戏点击）；按需挂载，不常驻 */
     private void createLogBubble() {
         TextView tv = new TextView(this);
         tv.setTextSize(12f);
@@ -839,11 +845,10 @@ public class FloatingWindowService extends Service {
                 overlayType(),
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                         | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-                        | WindowManager.LayoutParams.FLAG_SECURE,   // 气泡同样不进截图
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT);
         mBubbleParams.gravity = Gravity.TOP | Gravity.START;
-        mWindowManager.addView(tv, mBubbleParams);
+        // 这里不 addView：气泡只在真正要显示时才挂载，消失即卸载，避免残留 layer 进截图
         mBubbleView = tv;
     }
 
@@ -880,6 +885,10 @@ public class FloatingWindowService extends Service {
         if (!mBubbleVisible) {
             mBubbleView.setVisibility(View.VISIBLE);
             mBubbleView.setAlpha(0f);
+            // 首次弹（或上次已卸载）才挂载窗口；用完即卸，截图里不留 layer
+            if (mBubbleView.getParent() == null) {
+                addView(mBubbleView, mBubbleParams);
+            }
             mBubbleView.animate().alpha(1f).setDuration(160).start();
             mBubbleVisible = true;
         }
@@ -908,10 +917,13 @@ public class FloatingWindowService extends Service {
 
         mBubbleParams.x = clamp(x, 0, Math.max(0, screenW - w));
         mBubbleParams.y = clamp(centerY - h / 2, 0, Math.max(0, screenH - h));
-        try {
-            mWindowManager.updateViewLayout(mBubbleView, mBubbleParams);
-        } catch (Exception e) {
-            Log.w(LOG_TAG, "bubble layout failed: " + e.getMessage());
+        // 未挂载时只更新参数（下次 addView 生效），已挂载才真正重排
+        if (mBubbleView.getParent() != null) {
+            try {
+                mWindowManager.updateViewLayout(mBubbleView, mBubbleParams);
+            } catch (Exception e) {
+                Log.w(LOG_TAG, "bubble layout failed: " + e.getMessage());
+            }
         }
     }
 
@@ -922,6 +934,7 @@ public class FloatingWindowService extends Service {
         mBubbleVisible = false;
         mBubbleView.animate().cancel();
         mBubbleView.setVisibility(View.GONE);
+        removeView(mBubbleView);   // 卸载 layer，避免"看不见但截图里有黑块"
     }
 
     /** 气泡到时淡出 */
@@ -930,7 +943,10 @@ public class FloatingWindowService extends Service {
         mBubbleVisible = false;
         mBubbleView.animate().alpha(0f).setDuration(200)
                 .withEndAction(() -> {
-                    if (mBubbleView != null) mBubbleView.setVisibility(View.GONE);
+                    if (mBubbleView != null) {
+                        mBubbleView.setVisibility(View.GONE);
+                        removeView(mBubbleView);
+                    }
                 })
                 .start();
     }
@@ -960,8 +976,8 @@ public class FloatingWindowService extends Service {
                 // 不加 NOT_FOCUSABLE：页面输入框需要能获得焦点弹出键盘。
                 // 注意：不要依赖 FLAG_WATCH_OUTSIDE_TOUCH 做“点击窗口外收起”——该事件
                 // 在可聚焦 overlay + 游戏/多数 ROM 场景收不到，收起已交给悬浮球完成
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-                        | WindowManager.LayoutParams.FLAG_SECURE,   // 小窗同样不进截图
+                // 不加 FLAG_SECURE：它会让整块小窗在截图里变成黑矩形（见类注释实测说明）
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT);
         mWindowParams.gravity = Gravity.TOP | Gravity.START;
 
@@ -997,7 +1013,7 @@ public class FloatingWindowService extends Service {
             }
         });
 
-        mWindowManager.addView(mWindowView, mWindowParams);
+        // 这里不 addView：展开时才挂载，收起即卸载，避免"收起了但截图里仍有大黑块"
     }
 
     /** 展开/收起小窗 */
@@ -1037,14 +1053,19 @@ public class FloatingWindowService extends Service {
         // 展开期间隐藏悬浮球（不再占屏幕另一侧）；收起入口在遥控页左上角徽标 + 系统返回键
         mBallView.setVisibility(View.GONE);
 
-        mWindowManager.updateViewLayout(mWindowView, mWindowParams);
         mWindowView.setVisibility(View.VISIBLE);
+        if (mWindowView.getParent() == null) {
+            mWindowManager.addView(mWindowView, mWindowParams);
+        } else {
+            mWindowManager.updateViewLayout(mWindowView, mWindowParams);
+        }
         mWindowVisible = true;
     }
 
     private void collapseWindow() {
         if (mWindowView == null) return;
         mWindowView.setVisibility(View.GONE);
+        removeView(mWindowView);   // 卸载 layer：只 GONE 的话截图里仍是整块黑
         if (mWebView != null) {
             mWebView.onPause();
             mWebViewPaused = true;
@@ -1096,7 +1117,10 @@ public class FloatingWindowService extends Service {
                 mWindowParams.x = Math.max(0, Math.min(mWindowParams.x, screenW - size[0]));
             }
             mWindowParams.y = Math.max(0, Math.min(mWindowParams.y, screenH - size[1]));
-            mWindowManager.updateViewLayout(mWindowView, mWindowParams);
+            // 未挂载（已收起）时只更新参数，等下次展开时用新尺寸挂载
+            if (mWindowVisible && mWindowView.getParent() != null) {
+                mWindowManager.updateViewLayout(mWindowView, mWindowParams);
+            }
         }
         if (mBallParams == null) return;
         applyBallVisualState(isBallOnLeft());
@@ -1172,12 +1196,22 @@ public class FloatingWindowService extends Service {
     }
 
     private void removeView(View view) {
-        if (view != null) {
+        if (view != null && view.getParent() != null) {
             try {
                 mWindowManager.removeView(view);
             } catch (Exception e) {
                 Log.w(LOG_TAG, "removeView failed: " + e.getMessage());
             }
+        }
+    }
+
+    /** 挂载窗口（幂等：已挂载则跳过），配合 removeView 实现「按需挂载」 */
+    private void addView(View view, WindowManager.LayoutParams params) {
+        if (view == null || view.getParent() != null) return;
+        try {
+            mWindowManager.addView(view, params);
+        } catch (Exception e) {
+            Log.w(LOG_TAG, "addView failed: " + e.getMessage());
         }
     }
 

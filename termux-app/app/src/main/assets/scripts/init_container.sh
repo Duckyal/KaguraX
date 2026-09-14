@@ -33,6 +33,14 @@
 #            No such file or directory" —— 中断残留损坏的 uv 解压缓存
 #            (archive-v0/builds-v0) + proot 下 flock 不可靠导致并行踩踏。
 #            处理: 串行构建/安装 + 失败时按 清目录缓存 → 整删 uv 缓存 分级重试(见第 4 步)。
+#   2026-09  dpkg 写备份报 "error creating new backup file
+#            /var/lib/dpkg/status-old: Operation not permitted"，apt 三次重试全败、
+#            初始化中止 —— proot 以 --link2symlink 运行(proot-distro 默认)，dpkg 建
+#            status-old 备份走的是 link()，被模拟成 symlink()，目标已存在(上次 apt
+#            留有)时该调用被拒。同一批中断还会让 /var/lib/dpkg/status 损坏为空
+#            (只剩十几条包记录，dpkg 报 "Reading database ... 18 files")。
+#            处理: 每次 apt/dpkg 前 rm -f status-old(见第 1 步，幂等)；外层自检发现
+#            包记录过少时直接判容器不可用并重装(见第 0.5 步)。
 #            注意: 外层为单引号 login 块, 注释里严禁出现 ASCII 单引号。
 # ============================================================================
 
@@ -44,7 +52,7 @@
 
 # 脚本版本自检标记：运行日志首行即打印版本，便于确认设备 ~/init_container.sh 是否
 # 已是新版(旧版无此行)。AssetsUtils 会在 App 每次启动时按内容哈希自动覆盖成新版。
-echo "[init_container] init_container.sh v3 (2026-09-07: uv缓存预清理+串行构建+导入校验)"
+echo "[init_container] init_container.sh v4 (2026-09-13: dpkg status-old 自愈 + dpkg 数据库损坏自动重装容器)"
 
 # ---------- 0.24 Termux 换源 + apt 签名 key 就绪(幂等) ----------
 #    2026-09 修复 NO_PUBKEY:恢复包成功路径(restore_container.sh exit 0)会跳过
@@ -97,8 +105,29 @@ else
   fi
 fi
 
+# dpkg 数据库健康检查（2026-09 新增）：
+#   rootfs 文件齐全 ≠ 容器可用。apt/dpkg 中途被中断会让 /var/lib/dpkg/status 损坏，
+#   实测只剩十几条包记录（正常 80 条以上；dpkg 打印 "Reading database ... 18 files"，
+#   正常系统是 3 万量级文件）。此时 apt 认为系统上什么都没装，会重装 150+ 个基础包，
+#   耗时长且极易再次中断；而且这种状态"修"不如"重装"。故与 rootfs 文件缺失同等对待，
+#   一并走下方容器重装分支（/root/app 是 git clone 来的，重装后重新 clone 即可）。
+if [ "$container_ok" = 1 ]; then
+  dpkg_status="$ROOTFS/var/lib/dpkg/status"
+  if [ -f "$dpkg_status" ]; then
+    pkg_count=$(grep -c "^Package: " "$dpkg_status" 2>/dev/null || true)
+    [ -n "$pkg_count" ] || pkg_count=0
+    if [ "$pkg_count" -lt 30 ]; then
+      echo "[init_container] 容器 dpkg 数据库损坏(仅 $pkg_count 条包记录, 正常应 80 条以上),判定容器不可用"
+      container_ok=0
+    fi
+  else
+    echo "[init_container] 容器缺少 /var/lib/dpkg/status,判定容器不可用"
+    container_ok=0
+  fi
+fi
+
 if [ "$container_ok" != 1 ]; then
-  echo "[init_container] 容器文件系统不完整,自动重装 Debian(约数分钟)…"
+  echo "[init_container] 容器不可用(文件缺失或 dpkg 数据库损坏),自动重装 Debian(约数分钟)…"
   proot-distro remove debian -y >/dev/null 2>&1 || proot-distro remove debian >/dev/null 2>&1 || true
   proot-distro install docker.m.daocloud.io/library/debian || {
     echo "[init_container] 容器重装失败,请检查网络后重新初始化"
@@ -180,12 +209,33 @@ MIRROR_EOF
   #    ca-certificates 最先装：装完才有 CA 证书，后续 git clone / curl 走 https 才正常
   #    libgl1/libglib2.0-0: OpenCV(cv2) 运行时需要 libGL.so.1 等, 不装则 uv run 报
   #    "ImportError: libGL.so.1: cannot open shared object file"
-  #    网络容错：apt update/install 偶发超时失败（第一遍失败、第二遍成功常见原因），
-  #    失败自动重试最多 3 次；全部失败才中止。
+  #    网络容错：apt 偶发超时失败（第一遍失败、第二遍成功常见原因），失败自动重试最多 3 次。
+  #    用 apt-get 而非 apt：apt 的 CLI 不保证脚本兼容，stdout 非 tty 时(本项目
+  #    结尾做 2>&1 | tee 落盘)会打印 "apt does not have a stable CLI interface"
+  #    警告，与成败无关却极易被当成报错。
+  #    实测 2026-09：install 中途断网/被杀会留下 dpkg 半配置状态，之后 apt install
+  #    一律报 "dpkg was interrupted" 并提示手动 configure -a；不修 dpkg 则三次重试
+  #    必然全部失败、初始化直接中止。故每次尝试前先 configure -a（幂等，无需联网）。
+  #    实测 2026-09 之二(更底层)：dpkg 写 /var/lib/dpkg/status 前会先建 status-old
+  #    备份，走的是 link() 硬链接；而 proot 以 --link2symlink 运行(proot-distro
+  #    默认), link() 被模拟成 symlink()，status-old 已存在(上次 apt 建有)时该调用
+  #    直接 EPERM: "dpkg: error: error creating new backup file
+  #    /var/lib/dpkg/status-old: Operation not permitted"，dpkg 退出，此错三次重试
+  #    必然原样重现、与网络无关。status-old 只是备份文件，删掉即可(幂等)，故每次
+  #    尝试前先 rm，让 dpkg 重建。
+  #    注意: 上述 EPERM 发生在写备份那一步，说明 /var/lib/dpkg 目录本身可写，
+  #    所以这不是权限问题、重装 dpkg 也没用，只与 status-old 残留有关。
+  #    update 只做一次：它若绑在重试循环里，会把最慢的一步重复三遍。
+  echo "[init_container] 容器内 apt update（清华源，首次约 1-2 分钟，期间无输出属正常）…"
+  apt-get update </dev/null || echo "[init_container] apt update 失败,继续用现有索引尝试安装"
+
   APT_OK=0
   for attempt in 1 2 3; do
     echo "[init_container] 容器内 apt 安装基础工具(第 $attempt 次)…"
-    if apt update && apt install -y ca-certificates git curl adb libgl1 libglib2.0-0; then
+    rm -f /var/lib/dpkg/status-old /var/lib/dpkg/status-new 2>/dev/null || true
+    dpkg --configure -a </dev/null >/dev/null 2>&1 || true
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y </dev/null \
+        ca-certificates git curl adb libgl1 libglib2.0-0; then
       APT_OK=1
       break
     fi

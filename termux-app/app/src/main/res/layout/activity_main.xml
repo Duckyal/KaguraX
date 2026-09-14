@@ -5,318 +5,284 @@
     结构（垂直方向从上到下）：
      1. 顶部标题行：左侧应用名 + 副标题（占满剩余宽度），右侧「终端」描边按钮
      2. 中部白色卡片（ScrollView 包裹，小屏可滚动）：
-        · ADB 无线配对内嵌面板（状态条 + 「连接 / 首次配对」互斥切换，
-          默认只显示「连接」区块；点「首次配对」仅展开配对区块）
+        · ADB 无线调试面板（状态条 + 唯一的「配对 / 连接」入口按钮，
+          端口与配对码由自动流程读屏取得，走不通时走可填写通知）
         · 「启动项目 / 终止项目」大按钮
      3. 底部小按钮行：「一键初始化」与「检查更新」（幽灵风格，主色文字+图标）
 
-    说明：ADB 配对不再是弹窗 —— 状态检测、连接地址与首次配对输入框
-    全部直接铺在主界面卡片上（连接/配对两个区块互斥，一次只展开一个，
-    避免页面拥挤；逻辑见 AdbPairPanel）。
+    说明：ADB 配对全自动完成（AdbPairPanel 负责跳系统「无线调试」页，无障碍服务读屏、
+    自动点击并执行 adb），主界面只保留状态条与一个入口按钮 ——
+    端口、配对码、连接端口都只在系统页上显示且每次都变，放主页只会逼用户来回抄数字。
+    那一页上悬浮窗会被系统的 HIDE_OVERLAY_WINDOWS 隐藏，所以手动兜底走通知栏输入。
     不再有「打开网页」按钮——项目启动后悬浮遥控窗(悬浮球)会自动出现。
+
+    最外层 FrameLayout 只为了多叠一层启动遮罩（startup_overlay）：
+    冷启动时 onCreate 里那串初始化任务跑完前页面内容还没就绪，由遮罩盖住并显示
+    「缓冲圈 + 当前在干什么」，避免用户对着空屏发呆（见 MainActivity.runStartupTasks）。
+    遮罩底色与启动窗一致（见 values/themes.xml 的 windowBackground），过渡不会突兀。
 
     所有颜色引用 ?attr/ 自定义属性，随 Theme.MainActivity 昼夜主题自动切换。
 -->
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
-    android:layout_height="match_parent"
-    android:background="?attr/mainPageBackground"
-    android:orientation="vertical"
-    android:padding="20dp">
+    android:layout_height="match_parent">
 
-    <!-- ========== 顶部标题行 ========== -->
     <LinearLayout
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:gravity="center_vertical"
-        android:orientation="horizontal">
+        android:layout_height="match_parent"
+        android:background="?attr/mainPageBackground"
+        android:orientation="vertical"
+        android:padding="20dp">
 
-        <!-- 左侧标题区：占满剩余宽度，把「终端」按钮挤到右上角 -->
-        <LinearLayout
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:orientation="vertical">
-
-            <TextView
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="@string/application_name_manager"
-                android:textColor="?attr/mainTextPrimary"
-                android:textSize="26sp"
-                android:textStyle="bold" />
-
-            <TextView
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="2dp"
-                android:text="@string/main_subtitle"
-                android:textColor="?attr/mainTextSecondary"
-                android:textSize="13sp" />
-        </LinearLayout>
-
-        <!-- 右上角「终端」按钮：描边圆角风格，复用已有会话不新建 -->
-        <Button
-            android:id="@+id/btn_terminal"
-            android:layout_width="wrap_content"
-            android:layout_height="52dp"
-            android:background="@drawable/bg_btn_outline"
-            android:drawableStart="@drawable/ic_terminal"
-            android:drawablePadding="8dp"
-            android:paddingStart="20dp"
-            android:paddingEnd="20dp"
-            android:text="@string/action_open_terminal"
-            android:textAllCaps="false"
-            android:textColor="?attr/colorPrimary"
-            android:textSize="15sp" />
-    </LinearLayout>
-
-    <!-- ========== 中部卡片（ScrollView：内容超高时可滚动，不超高时垂直居中） ========== -->
-    <ScrollView
-        android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1"
-        android:fillViewport="true"
-        android:scrollbars="none">
-
+        <!-- ========== 顶部标题行 ========== -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:gravity="center_vertical"
-            android:orientation="vertical">
+            android:orientation="horizontal">
+
+            <!-- 左侧标题区：占满剩余宽度，把「终端」按钮挤到右上角 -->
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/application_name_manager"
+                    android:textColor="?attr/mainTextPrimary"
+                    android:textSize="26sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:text="@string/main_subtitle"
+                    android:textColor="?attr/mainTextSecondary"
+                    android:textSize="13sp" />
+            </LinearLayout>
+
+            <!-- 右上角「终端」按钮：描边圆角风格，复用已有会话不新建 -->
+            <Button
+                android:id="@+id/btn_terminal"
+                android:layout_width="wrap_content"
+                android:layout_height="52dp"
+                android:background="@drawable/bg_btn_outline"
+                android:drawableStart="@drawable/ic_terminal"
+                android:drawablePadding="8dp"
+                android:paddingStart="20dp"
+                android:paddingEnd="20dp"
+                android:text="@string/action_open_terminal"
+                android:textAllCaps="false"
+                android:textColor="?attr/colorPrimary"
+                android:textSize="15sp" />
+        </LinearLayout>
+
+        <!-- ========== 中部卡片（ScrollView：内容超高时可滚动，不超高时垂直居中） ========== -->
+        <ScrollView
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:fillViewport="true"
+            android:scrollbars="none">
 
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:background="@drawable/bg_card"
-                android:elevation="6dp"
-                android:orientation="vertical"
-                android:padding="20dp">
+                android:gravity="center_vertical"
+                android:orientation="vertical">
 
-                <!-- ========== ADB 无线配对面板标题 ========== -->
-                <TextView
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:text="@string/action_adb_pair"
-                    android:textColor="?attr/mainTextPrimary"
-                    android:textSize="17sp"
-                    android:textStyle="bold" />
-
-                <View
-                    android:layout_width="match_parent"
-                    android:layout_height="1dp"
-                    android:layout_marginTop="10dp"
-                    android:layout_marginBottom="10dp"
-                    android:background="?attr/mainDivider" />
-
-                <!-- 顶部连接状态（内容与颜色由 AdbPairPanel 动态刷新） -->
-                <TextView
-                    android:id="@+id/tv_adb_status"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:background="@drawable/bg_edittext"
-                    android:padding="10dp"
-                    android:text="@string/adb_loading"
-                    android:textColor="?attr/mainTextPrimary"
-                    android:textSize="14sp"
-                    android:textStyle="bold" />
-
-                <!-- ADB 分段切换控件：「连接 / 首次配对」互斥（整体一个凹槽控件，
-                     选中段主色高亮，一次只展开下方对应区块） -->
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_marginTop="10dp"
-                    android:background="@drawable/bg_segment"
-                    android:orientation="horizontal"
-                    android:padding="3dp">
+                    android:background="@drawable/bg_card"
+                    android:elevation="6dp"
+                    android:orientation="vertical"
+                    android:padding="20dp">
 
-                    <Button
-                        android:id="@+id/btn_connect_tab"
-                        android:layout_width="0dp"
-                        android:layout_height="42dp"
-                        android:layout_weight="1"
-                        android:background="@drawable/bg_tab_sel_left"
-                        android:gravity="center"
-                        android:minHeight="0dp"
-                        android:minWidth="0dp"
-                        android:padding="0dp"
-                        android:text="@string/adb_section_connect"
-                        android:textAllCaps="false"
-                        android:textColor="@color/white"
-                        android:textSize="13sp"
-                        android:textStyle="bold" />
-
-                    <Button
-                        android:id="@+id/btn_pair_tab"
-                        android:layout_width="0dp"
-                        android:layout_height="42dp"
-                        android:layout_weight="1"
-                        android:background="@android:color/transparent"
-                        android:gravity="center"
-                        android:minHeight="0dp"
-                        android:minWidth="0dp"
-                        android:padding="0dp"
-                        android:text="@string/adb_section_pair"
-                        android:textAllCaps="false"
-                        android:textColor="?attr/colorPrimary"
-                        android:textSize="13sp"
-                        android:textStyle="bold" />
-                </LinearLayout>
-
-                <!-- 日常连接区块：地址输入框 + 「连接」按钮（默认显示） -->
-                <LinearLayout
-                    android:id="@+id/layout_connect_section"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="10dp"
-                    android:gravity="center_vertical"
-                    android:orientation="horizontal">
-
-                    <EditText
-                        android:id="@+id/et_connect_address"
-                        android:layout_width="0dp"
+                    <!-- ========== ADB 无线配对面板标题 ========== -->
+                    <TextView
+                        android:layout_width="match_parent"
                         android:layout_height="wrap_content"
-                        android:layout_weight="1"
-                        android:background="@drawable/bg_edittext"
-                        android:hint="@string/adb_connect_address_hint"
-                        android:inputType="text"
-                        android:maxLines="1"
+                        android:text="@string/action_adb_pair"
                         android:textColor="?attr/mainTextPrimary"
-                        android:textColorHint="?attr/mainTextSecondary"
-                        android:textSize="15sp" />
+                        android:textSize="17sp"
+                        android:textStyle="bold" />
+
+                    <View
+                        android:layout_width="match_parent"
+                        android:layout_height="1dp"
+                        android:layout_marginTop="10dp"
+                        android:layout_marginBottom="10dp"
+                        android:background="?attr/mainDivider" />
+
+                    <!-- 顶部连接状态（内容与颜色由 AdbPairPanel 动态刷新） -->
+                    <TextView
+                        android:id="@+id/tv_adb_status"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:background="@drawable/bg_edittext"
+                        android:padding="10dp"
+                        android:text="@string/adb_loading"
+                        android:textColor="?attr/mainTextPrimary"
+                        android:textSize="14sp"
+                        android:textStyle="bold" />
+
+                    <!-- 配对 / 连接入口（主页唯一入口）：
+                         点击 = 跳系统「无线调试」页，之后由无障碍服务（AdbPairAccessibilityService）
+                         自动读码、配对、连接，进度走通知（AdbPairNotifier）。
+                         为什么要无障碍而不是浮窗：系统「设置」在 Android 12+ 持有
+                         HIDE_OVERLAY_WINDOWS，会隐藏第三方悬浮窗 —— 而配对码只在那一页显示，
+                         浮窗在系统页根本看不见，只能靠读屏 + 自动点击。
+                         主页不暴露端口输入框；自动失败时可点下面「手动填写」走浮窗兜底。 -->
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="10dp"
+                        android:text="@string/adb_pair_guide"
+                        android:textColor="?attr/mainTextSecondary"
+                        android:textSize="12sp" />
 
                     <Button
-                        android:id="@+id/btn_connect"
+                        android:id="@+id/btn_go_pair"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="10dp"
+                        android:background="@drawable/bg_btn_primary"
+                        android:minHeight="0dp"
+                        android:paddingTop="14dp"
+                        android:paddingBottom="14dp"
+                        android:text="@string/adb_pair_go"
+                        android:textAllCaps="false"
+                        android:textColor="?attr/colorOnPrimary"
+                        android:textSize="16sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp"
+                        android:text="@string/adb_pair_tip"
+                        android:textColor="?attr/mainTextSecondary"
+                        android:textSize="12sp" />
+
+                    <!-- 手动兜底入口：自动流程超时/失败时，用户还可以照系统页自己填一次
+                         （浮窗在 App 内可见，值由无障碍同步填好） -->
+                    <TextView
+                        android:id="@+id/btn_manual_pair"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:layout_marginStart="10dp"
+                        android:layout_gravity="end"
+                        android:layout_marginTop="2dp"
+                        android:padding="6dp"
+                        android:text="@string/adb_manual_entry"
+                        android:textColor="?attr/colorPrimary"
+                        android:textSize="12sp"
+                        android:textStyle="bold" />
+
+                    <View
+                        android:layout_width="match_parent"
+                        android:layout_height="1dp"
+                        android:layout_marginTop="14dp"
+                        android:layout_marginBottom="14dp"
+                        android:background="?attr/mainDivider" />
+
+                    <!-- 大按钮：启动项目 / 终止项目（文案由代码根据真实探测结果动态切换） -->
+                    <Button
+                        android:id="@+id/btn_project"
+                        android:layout_width="match_parent"
+                        android:layout_height="64dp"
                         android:background="@drawable/bg_btn_primary"
+                        android:drawableStart="@drawable/ic_power"
+                        android:drawablePadding="12dp"
                         android:paddingStart="20dp"
                         android:paddingEnd="20dp"
-                        android:minHeight="52dp"
-                        android:text="@string/adb_button_connect"
+                        android:text="@string/action_project_start"
                         android:textAllCaps="false"
                         android:textColor="?attr/colorOnPrimary"
-                        android:textSize="15sp" />
+                        android:textSize="17sp"
+                        android:textStyle="bold" />
+
                 </LinearLayout>
-
-                <!-- 首次配对区块（与「连接」区块互斥，默认隐藏）：
-                     配对地址 + 6 位配对码 + 「配对」按钮 -->
-                <LinearLayout
-                    android:id="@+id/layout_pair_section"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="10dp"
-                    android:orientation="vertical"
-                    android:visibility="gone">
-
-                    <EditText
-                        android:id="@+id/et_pair_address"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:layout_marginTop="10dp"
-                        android:background="@drawable/bg_edittext"
-                        android:hint="@string/adb_pair_address_hint"
-                        android:inputType="text"
-                        android:maxLines="1"
-                        android:textColor="?attr/mainTextPrimary"
-                        android:textColorHint="?attr/mainTextSecondary"
-                        android:textSize="15sp" />
-
-                    <EditText
-                        android:id="@+id/et_pair_code"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:layout_marginTop="10dp"
-                        android:background="@drawable/bg_edittext"
-                        android:hint="@string/adb_pair_code_hint"
-                        android:inputType="number"
-                        android:maxLength="6"
-                        android:maxLines="1"
-                        android:textColor="?attr/mainTextPrimary"
-                        android:textColorHint="?attr/mainTextSecondary"
-                        android:textSize="15sp" />
-
-                    <Button
-                        android:id="@+id/btn_pair"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:layout_marginTop="10dp"
-                        android:background="@drawable/bg_btn_primary"
-                        android:paddingTop="12dp"
-                        android:paddingBottom="12dp"
-                        android:text="@string/adb_button_pair"
-                        android:textAllCaps="false"
-                        android:textColor="?attr/colorOnPrimary"
-                        android:textSize="15sp" />
-                </LinearLayout>
-
-                <View
-                    android:layout_width="match_parent"
-                    android:layout_height="1dp"
-                    android:layout_marginTop="14dp"
-                    android:layout_marginBottom="14dp"
-                    android:background="?attr/mainDivider" />
-
-                <!-- 大按钮：启动项目 / 终止项目（文案由代码根据真实探测结果动态切换） -->
-                <Button
-                    android:id="@+id/btn_project"
-                    android:layout_width="match_parent"
-                    android:layout_height="64dp"
-                    android:background="@drawable/bg_btn_primary"
-                    android:drawableStart="@drawable/ic_power"
-                    android:drawablePadding="12dp"
-                    android:paddingStart="20dp"
-                    android:paddingEnd="20dp"
-                    android:text="@string/action_project_start"
-                    android:textAllCaps="false"
-                    android:textColor="?attr/colorOnPrimary"
-                    android:textSize="17sp"
-                    android:textStyle="bold" />
-
             </LinearLayout>
+        </ScrollView>
+
+        <!-- ========== 底部小按钮行 ========== -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:gravity="center"
+            android:orientation="horizontal">
+
+            <!-- 一键初始化：容器未安装时可用 -->
+            <Button
+                android:id="@+id/btn_init"
+                android:layout_width="wrap_content"
+                android:layout_height="52dp"
+                android:background="@drawable/bg_btn_ghost"
+                android:drawableStart="@drawable/ic_download"
+                android:drawablePadding="8dp"
+                android:paddingStart="20dp"
+                android:paddingEnd="20dp"
+                android:text="@string/action_init"
+                android:textAllCaps="false"
+                android:textColor="?attr/colorPrimary"
+                android:textSize="15sp" />
+
+            <!-- 次要操作：检查更新 -->
+            <Button
+                android:id="@+id/btn_check_update"
+                android:layout_width="wrap_content"
+                android:layout_height="52dp"
+                android:layout_marginStart="8dp"
+                android:background="@drawable/bg_btn_ghost"
+                android:drawableStart="@drawable/ic_refresh"
+                android:drawablePadding="8dp"
+                android:paddingStart="20dp"
+                android:paddingEnd="20dp"
+                android:text="@string/action_check_update"
+                android:textAllCaps="false"
+                android:textColor="?attr/colorPrimary"
+                android:textSize="15sp" />
         </LinearLayout>
-    </ScrollView>
-
-    <!-- ========== 底部小按钮行 ========== -->
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:gravity="center"
-        android:orientation="horizontal"
-        android:layout_marginTop="10dp">
-
-        <!-- 一键初始化：容器未安装时可用 -->
-        <Button
-            android:id="@+id/btn_init"
-            android:layout_width="wrap_content"
-            android:layout_height="52dp"
-            android:background="@drawable/bg_btn_ghost"
-            android:drawableStart="@drawable/ic_download"
-            android:drawablePadding="8dp"
-            android:paddingStart="20dp"
-            android:paddingEnd="20dp"
-            android:text="@string/action_init"
-            android:textAllCaps="false"
-            android:textColor="?attr/colorPrimary"
-            android:textSize="15sp" />
-
-        <!-- 次要操作：检查更新 -->
-        <Button
-            android:id="@+id/btn_check_update"
-            android:layout_width="wrap_content"
-            android:layout_height="52dp"
-            android:layout_marginStart="8dp"
-            android:background="@drawable/bg_btn_ghost"
-            android:drawableStart="@drawable/ic_refresh"
-            android:drawablePadding="8dp"
-            android:paddingStart="20dp"
-            android:paddingEnd="20dp"
-            android:text="@string/action_check_update"
-            android:textAllCaps="false"
-            android:textColor="?attr/colorPrimary"
-            android:textSize="15sp" />
     </LinearLayout>
 
-</LinearLayout>
+    <!-- ========== 启动遮罩 ==========
+         盖在整页之上，onCreate 的初始化任务跑完即撤（MainActivity.hideStartupOverlay）。
+         内容三层：品牌图标 → 缓冲圈 → 当前步骤文字，让等待看起来是"正在启动"而非卡死。 -->
+    <LinearLayout
+        android:id="@+id/startup_overlay"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="?attr/mainPageBackground"
+        android:gravity="center"
+        android:orientation="vertical"
+        android:visibility="gone">
+
+        <ImageView
+            android:layout_width="96dp"
+            android:layout_height="96dp"
+            android:contentDescription="@string/application_name_manager"
+            android:src="@drawable/ic_splash_logo" />
+
+        <ProgressBar
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:layout_marginTop="28dp"
+            android:indeterminateTint="?attr/colorPrimary" />
+
+        <TextView
+            android:id="@+id/tv_startup_status"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="18dp"
+            android:text="@string/startup_preparing"
+            android:textColor="?attr/mainTextSecondary"
+            android:textSize="14sp" />
+    </LinearLayout>
+
+</FrameLayout>

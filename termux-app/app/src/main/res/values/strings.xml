@@ -247,6 +247,12 @@
     <!-- 主界面标题下方副标题 -->
     <string name="main_subtitle">阴阳师自动化控制台</string>
 
+    <!-- 冷启动遮罩：首帧之后仍在跑的初始化步骤，逐条推进告诉用户当前在干什么 -->
+    <string name="startup_preparing">正在启动…</string>
+    <string name="startup_release_scripts">正在释放运行脚本…</string>
+    <string name="startup_prepare_env">正在准备运行环境…</string>
+    <string name="startup_check_status">正在检查容器与项目状态…</string>
+
     <!-- 主界面右上角「终端」按钮 -->
     <string name="action_open_terminal">终端</string>
 
@@ -290,6 +296,10 @@
     <!-- 已有 init 会话在跑时点击初始化按钮的提示 -->
     <string name="init_already_running">初始化正在进行中,已切换到初始化终端</string>
 
+    <!-- 初始化前询问安装哪条分支（决定容器内 git clone 拉哪条分支） -->
+    <string name="init_branch_title">选择要安装的分支</string>
+    <string name="init_branch_keep">使用当前分支</string>
+
     <!-- 首次初始化引导弹窗（项目未初始化时出现，文案按容器状态区分） -->
     <string name="init_guide_title">需要初始化</string>
     <string name="init_guide_message">检测到 Debian 容器尚未安装。\n\n点击「一键初始化」将新开终端会话，自动完成：\n1. pkg 安装 proot-distro\n2. 安装 Debian 容器\n3. 容器内初始化并首次安装项目（约 5-10 分钟）</string>
@@ -300,17 +310,10 @@
     <string name="adb_dialog_title">ADB 无线配对</string>
     <string name="adb_status_connected">已连接：%1$s</string>
     <!-- 未连接状态给出下一步引导，而非干巴巴的「未连接」 -->
-    <string name="adb_status_need_pair">未连接 · 请先首次配对</string>
-    <string name="adb_status_click_connect">未连接 · 请点击「连接」</string>
+    <string name="adb_status_need_pair">未连接 · 请先配对</string>
+    <string name="adb_status_click_connect">未连接 · 请点「配对 / 连接」</string>
     <string name="adb_status_not_init">容器未初始化</string>
-    <string name="adb_need_pair_first">尚未配对，请先完成「首次配对」</string>
-    <string name="adb_section_pair">首次配对</string>
-    <string name="adb_pair_address_hint">配对地址（如 192.168.1.100:37015）</string>
     <string name="adb_pair_code_hint">6 位配对码</string>
-    <string name="adb_button_pair">配对</string>
-    <string name="adb_section_connect">连接</string>
-    <string name="adb_connect_address_hint">连接地址（如 192.168.1.100:5555）</string>
-    <string name="adb_button_connect">连接</string>
     <string name="adb_pair_success">配对成功，正在自动连接…</string>
     <string name="adb_connect_success">连接成功</string>
     <string name="adb_connect_failed">连接失败，请检查地址和网络</string>
@@ -323,14 +326,97 @@
     <!-- 2026-09：无线调试连接加固提示。核心事实：被控端 Android 11+ 的连接端口不是 5555，
          而是每次开关「无线调试」都会变化的随机端口，需按设备页面当前显示的 IP:端口连接；
          连接遇 unauthorized 需在被控端点击授权或重新配对 -->
-    <string name="adb_input_need_port">连接地址需要端口：填被控端「无线调试」页当前显示的 IP:端口（例 192.168.1.100:43911）</string>
+    <string name="adb_input_need_port">请填写连接端口：系统「无线调试」页顶部「IP 地址和端口」冒号后面的数字</string>
     <string name="adb_pair_success_fill_port">配对成功。请按被控端「无线调试」页当前显示的 IP:端口补全连接地址再点「连接」（每次开关无线调试端口都会变）</string>
     <string name="adb_hint_unauthorized">被控端未授权：请在被控端屏幕点「允许 USB 调试/允许」；若没有弹窗，需在被控端重新开启无线调试并再次配对</string>
     <string name="adb_hint_re_authenticate">认证失败：开关无线调试后需重新配对。请在系统「使用配对码配对设备」中开启并填入新配对码</string>
     <string name="adb_hint_offline">被控端状态 offline：已先断开旧连接再重试；仍失败请稍候重连或重新开关无线调试</string>
-    <string name="adb_hint_cannot_connect">连不上被控端：请确认其无线调试已开启、地址为当前显示的 IP:端口（端口每次开关都会变化）、双方在同一网络</string>
+    <string name="adb_hint_cannot_connect">连不上被控端：请确认其无线调试已开启、填的端口是当前页面上显示的端口（端口每次开关都会变化）</string>
     <!-- 2026-09 追加：adb connect 文本成功但 adb devices 未确认到设备（假连接成功）时提示 -->
     <string name="adb_connect_not_ready">连接未确认：adb 已握手但设备未出现在设备列表（可能正在授权/无线调试不稳定），请稍后重试或重新开关无线调试</string>
+
+    <!-- ========== ADB 配对改版（2026-09）：一键跳系统页 + 配对助手全自动完成 ==========
+         前提事实：被控端就是本机（proot 容器与 Android 共享网络栈，容器内 adb 走 loopback），
+         所以 IP 恒为 127.0.0.1，界面上只需要端口，不再让用户抄 IP -->
+    <string name="adb_pair_guide">点下面按钮会跳到系统「无线调试」页，剩下的交给「配对助手」自动完成：读配对码 → 配对 → 读端口 → 连接，进度看通知栏。首次使用需在无障碍里开启「KaguraX 配对助手」。</string>
+    <string name="adb_pair_go">配对 / 连接</string>
+    <string name="adb_pair_tip">端口与配对码每次都不同，一律以系统页面当前显示为准。</string>
+    <string name="adb_pair_dev_options_off_title">开发者选项未开启</string>
+    <string name="adb_pair_dev_options_off_message">「无线调试」在开发者选项里，你还没开启开发者选项。\n\n开启方法：\n1. 设置 → 关于手机\n2. 连续点击「版本号」7 次\n3. 返回 设置 → 系统 → 开发者选项 → 无线调试\n\n开启后回来，再点一次刚才的入口。</string>
+    <string name="adb_pair_dev_options_go">去「关于手机」</string>
+    <string name="adb_pair_later">稍后</string>
+
+
+    <!-- 可填写通知（AdbPairInputReceiver + AdbPairNotifier.manual*）
+         为什么输入入口在通知栏：配对端口与配对码只在系统「无线调试」页上显示，而 Android 12 起
+         系统「设置」持有 HIDE_OVERLAY_WINDOWS，会隐藏第三方 TYPE_APPLICATION_OVERLAY 悬浮窗 ——
+         在那一页上浮窗**根本不可能出现**，所以改成通知：通知栏不受该限制，配个 RemoteInput
+         就能直接在里面输入。 -->
+    <string name="adb_manual_channel_name">手动配对输入</string>
+    <string name="adb_manual_channel_desc">以通知形式提供配对端口、配对码与连接端口的填写入口</string>
+    <string name="adb_manual_pair_title">手动配对 · 待填写</string>
+    <string name="adb_manual_pair_text">先在系统「无线调试」页点开「使用配对码配对设备」，那里有两个数字：\n· 配对端口 —— 「IP 地址和端口」冒号后面的那个\n· 6 位配对码\n\n下拉通知栏会盖住系统页，所以先把这两个数字看好，再点这条通知的「回复」把它们一起填进来（中间留个空格），例如：37015 123456\n记不牢也不要紧：先只填端口，收起通知栏看一眼配对码，再拉下来接着填 —— 输入框里的内容会留着。\n那行「IP 地址和端口」长按能整行复制，粘过来再补个空格和配对码，也认。\n\n配对期间这条通知会变成「正在配对」，请先留在这一页别动 —— 配对成功后会自动跳回 App。</string>
+    <string name="adb_manual_pair_reply_label">填配对信息</string>
+    <string name="adb_manual_pair_running">正在配对（端口 %1$s）…</string>
+    <string name="adb_manual_pair_failed">配对失败：%1$s\n\n请看一眼系统页上现在的端口与配对码（每次点开都可能变），照新的再填一次。</string>
+    <!-- 配对成功后才回 App（配对期间用户留在通知栏，系统页那边的配对会话不能被切走），此时人已看不到系统页：这条 Toast 要交代清楚下一步去哪复制连接端口 -->
+    <string name="adb_manual_pair_ok_next">配对成功。下一步：回系统「无线调试」页，长按复制顶部那行「IP 地址和端口」，下拉通知栏点「回复」粘贴进来就能连。</string>
+    <string name="adb_manual_pair_bad_input">没认出来：要的是「配对端口 + 6 位配对码」两个数字，例如 37015 123456。长按复制系统页「IP 地址和端口」那一行、再补个空格和配对码，也认。</string>
+    <string name="adb_manual_connect_title">手动连接 · 待填地址</string>
+    <string name="adb_manual_connect_text">配对成功。回到「无线调试」页，顶部那行「IP 地址和端口」长按就能整行复制（每次开关无线调试都会重新分配）。\n\n下拉通知栏点「回复」直接粘贴进来，例如 192.168.1.5:43911；只填端口 43911 也认。</string>
+    <string name="adb_manual_connect_text_reconnect">已配对过，这步不用再配对码了。回到「无线调试」页，顶部那行「IP 地址和端口」长按就能整行复制（每次开关无线调试都会重新分配）。\n\n下拉通知栏点「回复」直接粘贴进来，例如 192.168.1.5:43911；只填端口 43911 也认。</string>
+    <string name="adb_manual_connect_reply_label">粘贴 IP:端口</string>
+    <string name="adb_manual_connect_running">正在连接（%1$s）…</string>
+    <string name="adb_manual_connect_bad_port">没认出来：长按复制「无线调试」页顶部那行「IP 地址和端口」整行粘进来即可，例如 192.168.1.5:43911；只填端口 43911 也认。</string>
+    <string name="adb_manual_posted">输入框已发到通知栏：到系统「无线调试」页后，长按复制要填的那行，下拉通知栏点「回复」粘贴</string>
+    <string name="adb_manual_dev_options_fallback">没直达「无线调试」页：请在开发者选项里点进「无线调试」，再下拉通知栏点「回复」填数字</string>
+
+    <!-- ========== 配对助手（无障碍自动识别，AdbPairAccessibilityService） ==========
+         从系统「无线调试」页读端口与配对码，自动完成配对与连接：配对端口、配对码、连接端口
+         都只在系统页面上显示且每次都变，系统无公开接口可读，只能按页面文本识别 -->
+    <string name="adb_accessibility_label">KaguraX 配对助手</string>
+    <string name="adb_accessibility_summary">仅在一次自动配对 / 连接流程进行期间，读取系统「无线调试」页显示的端口与配对码，替你完成配对与连接</string>
+    <string name="adb_accessibility_desc">点「配对 / 连接」后，在此流程进行期间读取系统「无线调试」页面上的「IP 地址和端口」与「Wi-Fi 配对码」，替你完成配对与连接，进度显示在通知栏；流程结束立即停止读取。不读取其他页面内容，也不保存任何页面文本。</string>
+    <string name="adb_accessibility_guide_title">开启自动配对？</string>
+    <string name="adb_accessibility_guide_message">自动配对需要开启「KaguraX 配对助手」。开启后点一次「配对 / 连接」就会全自动完成：跳到系统「无线调试」页 → 读取配对码与端口 → 配对 → 连接，进度实时显示在通知栏，全程不用你操作。\n\n开启位置：系统设置 → 无障碍 → 已安装的服务 → KaguraX 配对助手\n\n注意：Android 13 及以上，如果开关是灰的点不动，需要先到「应用信息 → KaguraX → 右上角菜单」允许「受限设置」。\n\n另：有些系统（或手机管家）会在应用被清理后顺手把助手关掉。成功连上一次之后，助手会自动取得一项系统权限，之后即使被关掉也能自己开回来，不用再手动设置。\n\n不想开也可以，点「改用通知填写」：那里会把输入框发到通知栏，照着系统页上的数字填就行（悬浮窗在那一页会被系统强制隐藏，只有通知栏能用）。</string>
+    <string name="adb_accessibility_guide_go">去开启</string>
+    <string name="adb_accessibility_guide_skip">改用通知填写</string>
+
+    <!-- ========== 无障碍自动配对（AdbPairAccessibilityService + AdbPairNotifier） ==========
+         配对端口/配对码/连接端口只在系统「无线调试」页显示，而系统「设置」在 Android 12+
+         会隐藏第三方悬浮窗（HIDE_OVERLAY_WINDOWS），浮窗在那一页根本看不见 ——
+         所以主流程是：无障碍读屏 + 自动点击 + 后台执行 adb，进度用通知汇报；
+         走不通时的兜底是「可填写通知」，见下面 adb_manual_* 一组 -->
+    <string name="adb_notif_channel_name">配对进度</string>
+    <string name="adb_notif_channel_desc">自动配对与连接过程的进度提示</string>
+    <string name="adb_notif_result_channel_name">配对结果</string>
+    <string name="adb_notif_result_channel_desc">配对成功或失败的结果提醒（会以横幅弹出）</string>
+    <string name="adb_notif_title">ADB 无线调试</string>
+    <string name="adb_notif_success">已连接：%1$s</string>
+    <string name="adb_notif_fail_title">配对 / 连接未完成</string>
+    <string name="adb_auto_waiting_page">已开始自动配对，正在等待系统「无线调试」页…</string>
+    <string name="adb_auto_enabling">「无线调试」开关还关着，正在替你打开…</string>
+    <string name="adb_auto_entering_wireless">正在进入「无线调试」页…</string>
+    <string name="adb_auto_scrolling_to_entry">「无线调试」在列表下方，正在替你往下翻…</string>
+    <string name="adb_auto_entering_pair">正在进入「使用配对码配对设备」页面…</string>
+    <string name="adb_auto_page_ready">已打开「无线调试」页</string>
+    <string name="adb_auto_dev_options_fallback">已打开开发者选项，正在自动进入「无线调试」页…</string>
+    <string name="adb_auto_pairing">识别到配对码 %1$s，正在配对，请先留在此页…</string>
+    <string name="adb_auto_pair_ok">配对成功，正在读取连接端口…</string>
+    <!-- 连接端口在进配对页之前就记下了：配对一成功直接进连接，不再回主页读端口 -->
+    <string name="adb_auto_pair_ok_connecting">配对成功，正在连接…</string>
+    <string name="adb_auto_connecting">正在连接（端口 %1$s）…</string>
+    <string name="adb_auto_timeout">等不到系统页面的预期内容，自动流程已超时。可以回到 App 点「自动失败？手动填写」自己填一次。</string>
+    <string name="adb_auto_pair_failed">配对失败：%1$s\n\n请确认系统页上显示的配对码与端口没变，再点一次「配对 / 连接」。</string>
+    <string name="adb_auto_connect_failed">连接失败：%1$s</string>
+    <string name="adb_auto_need_auth">设备未授权：请在手机弹出的「允许调试」提示上点「允许」，然后回到 App 再点一次「配对 / 连接」。</string>
+    <string name="adb_auto_need_repair">上次配对已失效（认证被拒），需要重新配对：回到 App 再点一次「配对 / 连接」即可。</string>
+    <!-- 2026-09 追加：连不上时如果端口在听（说明是配对失效而不是端口没开），自动重配对一次 -->
+    <string name="adb_auto_repairing">配对已失效（无线调试重新开启过），正在自动重新配对…</string>
+    <string name="adb_auto_no_output">命令没有输出</string>
+    <string name="adb_auto_started">已开始自动配对，进度看通知栏</string>
+    <string name="adb_auto_not_ready">配对助手没就绪，再点一次「配对 / 连接」；若一直如此，去系统「无障碍」里确认「KaguraX 配对助手」是开着的</string>
+    <string name="adb_manual_entry">自动失败？手动填写</string>
 
     <!-- 终端按钮反馈 -->
     <string name="terminal_opening">正在打开容器终端（已存在则自动切换）</string>
@@ -361,6 +447,8 @@
     <string name="update_branch_custom_hint">例如 dev</string>
     <string name="update_branch_invalid">分支名不合法（仅限字母、数字与 . _ - /）</string>
     <string name="update_branch_saved">已切换更新分支：%1$s</string>
+    <!-- 项目已装时切换分支：会立即 fetch + checkout 该分支并 uv sync，即使没有新提交也执行 -->
+    <string name="update_branch_switching">已切换到 %1$s，正在拉取该分支代码并安装依赖，请到终端会话查看进度</string>
     <!-- APK 版本更新 -->
     <string name="update_apk_title">发现新版 App</string>
     <string name="update_apk_message">当前版本：%1$s\n最新版本：%2$s\n\n更新内容见 GitHub Release 说明。</string>

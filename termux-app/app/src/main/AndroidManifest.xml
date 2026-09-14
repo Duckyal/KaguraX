@@ -35,6 +35,9 @@
     <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Android 13+ 通知需运行时授权：自动配对/连接的进度靠通知汇报（浮窗在系统设置页
+         会被 HIDE_OVERLAY_WINDOWS 隐藏，只能走通知），未授权不影响流程本身 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" tools:ignore="ProtectedPermissions" />
     <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
 
@@ -194,6 +197,12 @@
             android:name=".app.TermuxOpenReceiver"
             android:exported="false" />
 
+        <!-- 「可填写通知」的回传口：用户在通知栏里敲进配对端口/配对码/连接端口，由这里接收并执行。
+             为什么手动兜底走通知栏而不是悬浮窗，见 AdbPairInputReceiver 的类注释。 -->
+        <receiver
+            android:name=".app.AdbPairInputReceiver"
+            android:exported="false" />
+
         <receiver
             android:name=".app.event.SystemEventReceiver"
             android:exported="false">
@@ -226,6 +235,27 @@
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Shows a draggable floating ball and a floating webview window over other apps for quick access to the project console" />
+        </service>
+
+        <!-- 配对助手：从系统「无线调试」页面自动读取配对端口/配对码/连接端口，自动完成配对与连接。
+             只在自动流程进行期间读屏，流程结束立即停止（逻辑见 AdbPairAccessibilityService）。
+
+             stopWithTask=false：用户从最近任务划掉本应用时不要顺带停掉无障碍服务。
+             默认值是 true，会让系统在任务被移除时对这一路服务下手 —— 而配对助手恰恰是
+             「点完按钮就跳到系统页、人不在本应用里」的那种用法，任务被划掉是常态。 -->
+        <service
+            android:name=".app.AdbPairAccessibilityService"
+            android:exported="true"
+            android:label="@string/adb_accessibility_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:stopWithTask="false">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/adb_pair_accessibility_service" />
         </service>
 
         <service

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  配对助手（AdbPairAccessibilityService）的无障碍服务配置。
+
+  为什么需要无障碍：配对端口、配对码、连接端口三者都只在系统「无线调试」页面上显示，
+  系统没有公开 API 可读（每次开启无线调试都重新随机生成），只能按页面文本读取。
+  有了它，用户不用再手抄数字。
+
+  配置取舍：
+    · 不限制 packageNames —— 各 ROM 的「无线调试」页可能不在 com.android.settings 下
+      （MIUI/ColorOS 等有封装），限制包名会导致读取不到；改为在服务代码里限制读取时机：
+      只有自动流程进行中才读屏，且跳过本应用自身的窗口。
+    · eventTypes 只订阅窗口状态/内容变化，notificationTimeout 让系统合并高频事件。
+    · flags 不带 flagRequestFilterKeyEvents / flagRequestTouchExplorationMode，
+      不拦截按键、不接管触摸 —— 平时纯被动读取，只在必须替用户点一下的时候
+      （进「无线调试」页、进配对页、打开无线调试总开关）才用 ACTION_CLICK 或手势点击。
+    · canPerformGestures 打开是为了「点不动时的兜底」：AOSP Settings 的列表项常常只有
+      父容器带 clickable 标记，个别 ROM 连容器都没标，只靠 ACTION_CLICK 会一直点不动。
+    -->
+    <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+      android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+      android:accessibilityFeedbackType="feedbackGeneric"
+      android:accessibilityFlags="flagReportViewIds"
+      android:canPerformGestures="true"
+      android:canRetrieveWindowContent="true"
+    android:description="@string/adb_accessibility_desc"
+    android:notificationTimeout="200"
+    android:summary="@string/adb_accessibility_summary" />
