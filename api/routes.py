@@ -334,7 +334,12 @@ async def run_task(request: Request):
         TaskClass = getattr(module, f'Task_{task_name}')
         
         # 创建设备对象
-        device = ADB(device_id, mode)
+        device = ADB(
+            device_id,
+            mode,
+            enable_match_debug=bool(config.get("enable_match_debug", False)),
+            task_name=task_name,
+        )
         
         # 注册停止信号 (必须)
         register_stop_signal(device_id)
@@ -546,26 +551,52 @@ async def send_test_email_api(request: Request):
 # ===============================================================================================================================
 # 自定义任务辅助接口
 # ===============================================================================================================================
-TMP_IMG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "tasks", "tmp")
+PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
+TMP_IMG_DIR = os.path.join(PROJECT_ROOT, "tasks", "tmp")
+DEBUG_MATCH_DIR = os.path.join(PROJECT_ROOT, "debug", "match")
+
+
+def _collect_image_paths(roots):
+    images = []
+    seen = set()
+    for root in roots:
+        if not root or not os.path.exists(root):
+            continue
+        for dirpath, _, files in os.walk(root):
+            for f in files:
+                ext = os.path.splitext(f)[1].lower()
+                if ext not in (".png", ".jpg", ".jpeg", ".bmp"):
+                    continue
+                abs_path = os.path.join(dirpath, f)
+                rel = os.path.relpath(abs_path, PROJECT_ROOT)
+                rel = rel.replace("\\", "/")
+                if rel not in seen:
+                    seen.add(rel)
+                    images.append(rel)
+    images.sort()
+    return images
+
 
 @router.get("/api/list_tmp_images")
 def list_tmp_images():
-    """列出 tasks/tmp 目录下所有图片文件名（含子目录）"""
-    images = []
-    try:
-        root = TMP_IMG_DIR
-        if os.path.exists(root):
-            for dirpath, _, files in os.walk(root):
-                for f in files:
-                    ext = os.path.splitext(f)[1].lower()
-                    if ext in (".png", ".jpg", ".jpeg", ".bmp"):
-                        # 返回相对路径，如 tasks/tmp/btn_1920x1080.png
-                        abs_path = os.path.join(dirpath, f)
-                        rel = os.path.relpath(abs_path, os.path.dirname(os.path.dirname(__file__)))
-                        images.append(rel.replace("\\", "/"))
-        images.sort()
-    except Exception:
-        pass
+    """列出任务模板目录、debug 目录和 tmp 目录下的图片文件（含子目录）"""
+    roots = [TMP_IMG_DIR, DEBUG_MATCH_DIR]
+    roots.extend([os.path.join(PROJECT_ROOT, 'tasks')])
+    images = _collect_image_paths(roots)
+    return JSONResponse(content={"images": images})
+
+
+@router.get("/api/list_debug_images")
+def list_debug_images():
+    """列出所有任务目录下 debug 子目录中的图片，用于手机端查看匹配调试图。"""
+    roots = [os.path.join(PROJECT_ROOT, 'tasks')]
+    debug_roots = []
+    for dirpath, _, _ in os.walk(os.path.join(PROJECT_ROOT, 'tasks')):
+        if os.path.basename(dirpath) == 'debug':
+            debug_roots.append(dirpath)
+    roots.extend(debug_roots)
+    roots.append(DEBUG_MATCH_DIR)
+    images = _collect_image_paths(roots)
     return JSONResponse(content={"images": images})
 
 @router.post("/api/custom_generate_code")

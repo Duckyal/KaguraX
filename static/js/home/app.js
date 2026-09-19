@@ -101,7 +101,10 @@ const App = {
     const payload = {
       task: task,
       device: this.deviceName,
-      config: config
+      config: {
+        ...config,
+        enable_match_debug: true
+      }
     };
 
     try {

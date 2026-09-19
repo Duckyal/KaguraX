@@ -9,6 +9,7 @@ import android.content.ClipboardManager;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.net.Uri;
+import androidx.documentfile.provider.DocumentFile;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -27,15 +28,24 @@ import com.termux.shared.android.PermissionUtils;
 import com.termux.shared.termux.shell.TermuxShellManager;
 import com.termux.shared.termux.shell.command.runner.terminal.TermuxSession;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
+import java.util.Locale;
 
 import com.termux.shared.termux.settings.preferences.TermuxAppSharedPreferences;
 import com.termux.shared.termux.settings.properties.TermuxAppSharedProperties;
@@ -127,6 +137,12 @@ public class MainActivity extends Activity {
 
     /** 底部「检查更新」按钮 */
     private Button btnCheckUpdate;
+
+    /** 底部「复制 debug 目录」按钮：把项目中的 debug 文件夹拷到用户选择的目录 */
+    private Button btnCopyDebugDir;
+
+    /** 选择导出目录的请求码 */
+    private static final int REQUEST_COPY_DEBUG_DIR = 1002;
 
     /** 主界面内嵌的 ADB 配对面板：状态检测/连接/首次配对直接铺在页面上（非弹窗） */
     private AdbPairPanel mAdbPanel;
@@ -392,11 +408,21 @@ public class MainActivity extends Activity {
         }
     }
 
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_COPY_DEBUG_DIR && resultCode == Activity.RESULT_OK && data != null && data.getData() != null) {
+            Uri treeUri = data.getData();
+            copyDebugDirectoryToSelectedUri(treeUri);
+        }
+    }
+
     private void initViews() {
         btnTerminal = findViewById(R.id.btn_terminal);
         btnProject = findViewById(R.id.btn_project);
         btnInit = findViewById(R.id.btn_init);
         btnCheckUpdate = findViewById(R.id.btn_check_update);
+        btnCopyDebugDir = findViewById(R.id.btn_copy_debug_dir);
         // 启动遮罩（默认可见；初始化跑完由 hideStartupOverlay 撤掉）
         startupOverlay = findViewById(R.id.startup_overlay);
         tvStartupStatus = findViewById(R.id.tv_startup_status);
@@ -410,12 +436,118 @@ public class MainActivity extends Activity {
         btnProject.setOnClickListener(v -> toggleProject());
         btnInit.setOnClickListener(v -> startInit());
         btnCheckUpdate.setOnClickListener(v -> checkUpdate());
+        btnCopyDebugDir.setOnClickListener(v -> pickDebugDirectory());
         // 长按「检查更新」= 直接选择更新分支（如切到 dev 测试分支代码）；
         // 「已是最新」时没有弹窗可跳，这条入口保证任何时候都能切分支。
         btnCheckUpdate.setOnLongClickListener(v -> {
             showBranchPickerDialog();
             return true;    // 消费长按，避免松手后又触发一次点击检查
         });
+    }
+
+    private File getProjectDebugDir() {
+        for (String projectDirPath : PROJECT_APP_DIRS) {
+            File projectDir = new File(projectDirPath);
+            if (!projectDir.isDirectory()) {
+                continue;
+            }
+            File debugDir = new File(projectDir, "debug");
+            if (debugDir.isDirectory()) {
+                return debugDir;
+            }
+        }
+        return null;
+    }
+
+    private void pickDebugDirectory() {
+        File debugDir = getProjectDebugDir();
+        if (debugDir == null) {
+            Toast.makeText(this, "当前项目没有 debug 目录，先跑一次任务生成后再复制。", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        startActivityForResult(intent, REQUEST_COPY_DEBUG_DIR);
+    }
+
+    private void copyDebugDirectoryToSelectedUri(Uri treeUri) {
+        File debugDir = getProjectDebugDir();
+        if (debugDir == null || !debugDir.isDirectory()) {
+            Toast.makeText(this, "没有找到 debug 目录。", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        final int takeFlags = getIntent().getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        try {
+            getContentResolver().takePersistableUriPermission(treeUri, takeFlags);
+        } catch (SecurityException e) {
+            Log.w(LOG_TAG, "takePersistableUriPermission failed: " + e.getMessage());
+        }
+
+        DocumentFile rootDir = DocumentFile.fromTreeUri(this, treeUri);
+        if (rootDir == null) {
+            Toast.makeText(this, "无法读取所选目录。", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        String folderName = "KaguraX_debug_" + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(new Date());
+        DocumentFile targetDir = rootDir.createDirectory(folderName);
+        if (targetDir == null) {
+            Toast.makeText(this, "无法创建目标目录。", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        try {
+            copyFolderToDocumentFile(debugDir, targetDir);
+            Toast.makeText(this, "已复制 debug 目录到：" + targetDir.getUri(), Toast.LENGTH_LONG).show();
+        } catch (IOException e) {
+            Log.e(LOG_TAG, "copy debug dir failed", e);
+            Toast.makeText(this, "复制失败：" + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void copyFolderToDocumentFile(File sourceDir, DocumentFile targetDir) throws IOException {
+        File[] files = sourceDir.listFiles();
+        if (files == null) {
+            return;
+        }
+
+        for (File file : files) {
+            if (file.isDirectory()) {
+                DocumentFile childDir = targetDir.findFile(file.getName());
+                if (childDir == null) {
+                    childDir = targetDir.createDirectory(file.getName());
+                }
+                if (childDir != null) {
+                    copyFolderToDocumentFile(file, childDir);
+                }
+                continue;
+            }
+
+            DocumentFile childFile = targetDir.findFile(file.getName());
+            if (childFile != null && childFile.exists()) {
+                childFile.delete();
+            }
+
+            DocumentFile newFile = targetDir.createFile("application/octet-stream", file.getName());
+            if (newFile == null) {
+                throw new IOException("无法创建文件：" + file.getName());
+            }
+
+            try (InputStream in = new BufferedInputStream(new FileInputStream(file));
+                 OutputStream out = new BufferedOutputStream(getContentResolver().openOutputStream(newFile.getUri()))) {
+                if (out == null) {
+                    throw new IOException("无法打开目标输出流：" + file.getName());
+                }
+                byte[] buffer = new byte[8192];
+                int read;
+                while ((read = in.read(buffer)) != -1) {
+                    out.write(buffer, 0, read);
+                }
+                out.flush();
+            }
+        }
     }
 
     // ==================== 右上角「终端」按钮 ====================

@@ -600,7 +600,10 @@ const FloatApp = {
     const payload = {
       task: this.activeTask,
       device: this.device,
-      config: this.collectConfig()
+      config: {
+        ...this.collectConfig(),
+        enable_match_debug: false
+      }
     };
 
     try {

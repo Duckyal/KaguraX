@@ -233,6 +233,21 @@
                 android:textColor="?attr/colorPrimary"
                 android:textSize="15sp" />
 
+            <!-- 次要操作：复制 debug 目录 -->
+            <Button
+                android:id="@+id/btn_copy_debug_dir"
+                android:layout_width="wrap_content"
+                android:layout_height="52dp"
+                android:layout_marginStart="8dp"
+                android:background="@drawable/bg_btn_ghost"
+                android:drawablePadding="8dp"
+                android:paddingStart="20dp"
+                android:paddingEnd="20dp"
+                android:text="复制 debug 目录"
+                android:textAllCaps="false"
+                android:textColor="?attr/colorPrimary"
+                android:textSize="15sp" />
+
             <!-- 次要操作：检查更新 -->
             <Button
                 android:id="@+id/btn_check_update"

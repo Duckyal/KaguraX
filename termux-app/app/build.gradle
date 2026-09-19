@@ -56,7 +56,7 @@ android {
         // 发新版 APK 时：versionCode 必须递增(Android 覆盖安装要求)，versionName
         // 与 Release tag 一致；也可用环境变量 TERMUX_APP_VERSION_NAME 覆盖。
         versionCode 127
-        versionName "1.2.1"
+        versionName "1.2.2"
 
         if (appVersionName) versionName = appVersionName
         validateVersionName(versionName)

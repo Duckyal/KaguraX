@@ -86,9 +86,25 @@ class ADB():
     # 用字典代替单一的 _instance，key 是传入的参数，value 是对应的实例
     _instances = {}
 
-    def __new__(cls, device_id: str, mode: str = "less", max_workers=4, adapt_res_everytime: bool = False, source: str = "server"):
+    @staticmethod
+    def _sanitize_debug_component(value):
+        """将任务名/设备名规范成安全的目录名，保留中文和常用字符。"""
+        raw = str(value or 'unknown_task').strip()
+        if not raw:
+            raw = 'unknown_task'
+        cleaned = re.sub(r'[\\/:*?"<>|\x00-\x1f\x7f]+', '_', raw)
+        cleaned = cleaned.strip('_. ')
+        return cleaned or 'unknown_task'
+
+    def _debug_base_dir(self):
+        """返回项目根目录下的统一 debug 根目录：debug/<task_name>/"""
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        task_name = self._sanitize_debug_component(getattr(self, 'task_name', 'unknown_task'))
+        return os.path.join(project_root, 'debug', task_name)
+
+    def __new__(cls, device_id: str, mode: str = "less", max_workers=4, adapt_res_everytime: bool = False, source: str = "server", enable_match_debug: bool = False, task_name: str = ""):
         # 把传入的参数变成一个可哈希的 key（比如元组）
-        cache_key = (device_id, mode, max_workers, adapt_res_everytime, source)
+        cache_key = (device_id, mode, max_workers, adapt_res_everytime, source, bool(enable_match_debug), str(task_name))
         
         # 如果这个参数组合没被实例化过，就新建一个
         if cache_key not in cls._instances:
@@ -96,7 +112,7 @@ class ADB():
         # 返回这个参数对应的唯一实例
         return cls._instances[cache_key]
 
-    def __init__(self, device_id: str, mode: str = "less", max_workers=4, adapt_res_everytime: bool = False, source: str = "server"):
+    def __init__(self, device_id: str, mode: str = "less", max_workers=4, adapt_res_everytime: bool = False, source: str = "server", enable_match_debug: bool = False, task_name: str = ""):
         """
         初始化ADB实例，连接指定设备。
         :param device_id: 设备ID，或"None"表示连接所有设备。
@@ -104,6 +120,8 @@ class ADB():
         :param max_workers: 最大线程数。
         :param adapt_res_everytime: 是否每次找图都适配分辨率。
         :param source: 日志来源，"server"或"client"。
+        :param enable_match_debug: 是否在每次命中时保存对应模板的 debug 裁剪图，默认 False。
+        :param task_name: 当前任务名，用于统一 debug 根目录：debug/<task_name>/
         :return: ADB实例。
         """
         # 由于 Python 机制，每次 return 缓存实例时，都会强制调用 __init__
@@ -118,6 +136,8 @@ class ADB():
 
         self.max_workers = max_workers  
         self.adapt_res_everytime = adapt_res_everytime
+        self.enable_match_debug = bool(enable_match_debug)
+        self.task_name = self._sanitize_debug_component(task_name or getattr(self, 'task_name', 'unknown_task'))
         self.current_scale = None       # 参考分辨率组的缩放比（无基准信息模板的兜底值）
         self.current_scale_x = None     # 每张模板各自持有 scale_x/scale_y；这两个是"参考组"的值
         self.current_scale_y = None
@@ -707,6 +727,164 @@ class ADB():
 
         return _start(x1), _start(y1), _end(x2), _end(y2)
 
+    def _build_resolution_index(self, root_dir):
+        """扫描模版目录，按 stem 名称建立分辨率索引：{base_name: [(w,h,path), ...]}。"""
+        index = {}
+        if not root_dir or not os.path.isdir(root_dir):
+            return index
+        for dirpath, _, files in os.walk(root_dir):
+            for name in files:
+                stem, _ = os.path.splitext(name)
+                m = re.search(r'_(\d+)x(\d+)$', stem)
+                if not m:
+                    continue
+                base_name = stem[:m.start()]
+                w = int(m.group(1))
+                h = int(m.group(2))
+                index.setdefault(base_name, []).append((w, h, os.path.join(dirpath, name)))
+        for base_name in index:
+            index[base_name].sort(key=lambda item: (item[0], item[1]))
+        return index
+
+    def _find_best_resolution_match(self, image_path, target_w=None, target_h=None):
+        """
+        搜索同名模板中是否有对应分辨率；没有时返回最近分辨率的模板。
+        还支持输入一个不带 _WxH 后缀的基名，例如：
+            tasks/xxx/挑战.png
+        会自动扫描同目录中同名的所有 _1920x1080 / _1080x2340 版本并挑最接近的一个。
+        若同目录没有，进一步扫描其父目录树中的候选分辨率模板库。
+        """
+        if not isinstance(image_path, str) or not image_path:
+            return image_path, []
+
+        if target_w is None or target_h is None:
+            target_w, target_h = self.width, self.height
+        target_w = int(target_w)
+        target_h = int(target_h)
+
+        # 1) 原路径本身存在，直接返回；这样不会破坏明确指定的模板文件
+        if os.path.exists(image_path):
+            return image_path, [(target_w, target_h, image_path)]
+
+        full_dir = os.path.dirname(image_path)
+        file_name = os.path.basename(image_path)
+        if not full_dir or not file_name:
+            return image_path, []
+
+        stem, ext = os.path.splitext(file_name)
+        stem_no_res = re.sub(r'_\d+x\d+$', '', stem)
+        exact = os.path.join(full_dir, f"{stem_no_res}_{target_w}x{target_h}{ext}")
+        if os.path.exists(exact):
+            return exact, [(target_w, target_h, exact)]
+
+        candidates = []
+        search_roots = [full_dir]
+        if full_dir:
+            search_roots.append(os.path.dirname(full_dir))
+        seen = set()
+        for root in search_roots:
+            if not os.path.isdir(root):
+                continue
+            for dirpath, _, files in os.walk(root):
+                for item in files:
+                    path = os.path.join(dirpath, item)
+                    if path in seen:
+                        continue
+                    seen.add(path)
+                    base, _ = os.path.splitext(item)
+                    if not base.startswith(stem_no_res):
+                        continue
+                    m = re.search(r'_(\d+)x(\d+)$', base)
+                    if not m:
+                        continue
+                    w = int(m.group(1))
+                    h = int(m.group(2))
+                    score = abs(w - target_w) + abs(h - target_h)
+                    ratio_diff = abs((w / max(h, 1)) - (target_w / max(target_h, 1)))
+                    candidates.append((score, ratio_diff, w, h, path))
+
+        if not candidates:
+            return image_path, []
+
+        candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+        best_path = candidates[0][4]
+        best_candidates = [(w, h, p) for _, _, w, h, p in candidates[:5]]
+        if self.mode == 'more':
+            self.log(f"未找到 {target_w}x{target_h} 对应模板，使用近似分辨率 {candidates[0][2]}x{candidates[0][3]}: {best_path}", 'debug')
+            self.log(f"候选分辨率模板: {best_candidates}", 'debug')
+        return best_path, best_candidates
+
+    def _save_match_crop(self, screenshot_img, img_name, match_value, save_dir=None):
+        """统一保存在项目根目录下 debug/<task_name>/ 下，不再写到模板目录或其 nested debug 子目录。
+        例如：debug/突破/奖励_1920x1080.png
+        同一模板在同一分辨率下只保留一张，只有当新 score 更高时才覆盖旧图。
+        """
+        if not getattr(self, 'enable_match_debug', False):
+            return None
+        if screenshot_img is None or not match_value or len(match_value) < 6:
+            return None
+        try:
+            if save_dir is None:
+                save_dir = self._debug_base_dir()
+            os.makedirs(save_dir, exist_ok=True)
+
+            center_x, center_y, _, w_match, h_match, score = match_value
+            h, w = screenshot_img.shape[:2]
+            x1 = max(0, int(center_x - w_match / 2))
+            y1 = max(0, int(center_y - h_match / 2))
+            x2 = min(w, int(center_x + w_match / 2))
+            y2 = min(h, int(center_y + h_match / 2))
+            if x2 <= x1 or y2 <= y1:
+                return None
+
+            crop = screenshot_img[y1:y2, x1:x2]
+            if crop.size == 0:
+                return None
+
+            raw_name = os.path.splitext(os.path.basename(img_name))[0]
+            raw_name = re.sub(r'_\d+x\d+$', '', raw_name)
+            # 仅清理 Windows/路径非法字符，保留中文、字母、数字、下划线和横线；
+            # 避免像“奖励_1920x1080.png”这类模板名被错误清洗成“__1920x1080_png”。
+            safe_name = re.sub(r'[\\/:*?"<>|\x00-\x1f\x7f]+', '_', raw_name).strip('_. ')
+            if not safe_name:
+                safe_name = 'template'
+            file_name = f"{safe_name}_{self.width}x{self.height}.png"
+            output_path = os.path.join(save_dir, file_name)
+            info_path = os.path.join(save_dir, f"{safe_name}_{self.width}x{self.height}.txt")
+
+            if os.path.exists(info_path):
+                try:
+                    with open(info_path, 'r', encoding='utf-8') as f:
+                        prev = f.read().strip()
+                    prev_score = None
+                    for line in prev.splitlines():
+                        if line.startswith('score='):
+                            try:
+                                prev_score = float(line.split('=', 1)[1])
+                            except Exception:
+                                pass
+                    if prev_score is not None and score <= prev_score:
+                        return output_path
+                except Exception:
+                    pass
+
+            cv2.imwrite(output_path, crop)
+            info_text = (
+                f"template_name={img_name}\n"
+                f"task_name={self.task_name}\n"
+                f"device_resolution={self.width}x{self.height}\n"
+                f"match_center=({int(center_x)}, {int(center_y)})\n"
+                f"match_size=({int(w_match)}, {int(h_match)})\n"
+                f"score={score:.4f}\n"
+                f"crop_box=(x1={x1}, y1={y1}, x2={x2}, y2={y2})\n"
+            )
+            with open(info_path, 'w', encoding='utf-8') as f:
+                f.write(info_text)
+            return output_path
+        except Exception as e:
+            self.log(f"保存匹配截图失败({img_name}): {e}", 'warning')
+            return None
+
     def 图片预加载(self, *images, base_resolution=None):
         '''
         在进入 while 循环前，一次性把所有图片读入内存并转为灰度图。
@@ -726,6 +904,29 @@ class ADB():
                预加载阶段不再为每张 ≥50x50 的图做 11 次 resize；
             3. 同名换图时一并清空 _pyramid_cache，避免拿旧图的金字塔去匹配新图。
         '''
+        if base_resolution is None:
+            base_resolution = (self.width, self.height)
+
+        normalized_images = []
+        resolution_logs = []
+        for img in images:
+            if isinstance(img, str):
+                chosen_path, candidates = self._find_best_resolution_match(img, *base_resolution)
+                normalized_images.append(chosen_path)
+                resolution_logs.append((img, chosen_path, candidates))
+            else:
+                normalized_images.append(img)
+                resolution_logs.append((None, None, []))
+
+        if self.mode == 'more':
+            for original, chosen, candidates in resolution_logs:
+                if not original:
+                    continue
+                if chosen == original:
+                    self.log(f"模板分辨率解析: {original} -> 直接使用原图", 'debug')
+                else:
+                    self.log(f"模板分辨率解析: {original} -> {chosen} | 候选={candidates}", 'debug')
+
         self.cached_templates.clear()
         self._find_cache.clear()     # 换了一批模板，旧的命中缓存（名称可能复用但图不同）一并作废
         self._pyramid_cache.clear()  # 金字塔基于模板内容构建，模板换了必须重建，否则匹配的是旧图
@@ -738,11 +939,11 @@ class ADB():
 
         # 并发解码：分批提交，保证两张图之间仍能响应停止指令（与原逐张 check_stop 的可中断性一致）
         t_start = time.time()
-        workers = min(8, max(1, len(images)))
+        workers = min(8, max(1, len(normalized_images)))
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            for start in range(0, len(images), workers):
+            for start in range(0, len(normalized_images), workers):
                 check_stop(self)
-                batch = list(enumerate(images))[start:start + workers]
+                batch = list(enumerate(normalized_images))[start:start + workers]
                 loaded = pool.map(lambda pair: self._load_template(pair[1], pair[0], base_resolution), batch)
                 for (idx, img), (img_name, temp_info, warn) in zip(batch, loaded):
                     if img_name is None or temp_info is None:
@@ -1032,12 +1233,21 @@ class ADB():
             except (TypeError, ValueError, IndexError):
                 pass
 
+        source_path = None
+        if isinstance(img, str):
+            source_path = img
+        elif hasattr(img, 'filename') and img.filename:
+            source_path = img.filename
+        elif hasattr(img, 'name') and isinstance(img.name, str):
+            source_path = img.name
+
         temp_info = {
             'img': gray_img,
             'h': gray_img.shape[0],
             'w': gray_img.shape[1],
             'screen_width': screen_width,
             'screen_height': screen_height,
+            'source_path': source_path,
             # 名义缩放比 = 截图尺寸 / 该图自身基准分辨率；实际缩放比 = 名义比 × 修正因子
             # 两者都在 _compute_template_scales 里统一填充（每张模板各算各的）
             'scale_nominal_x': None,
@@ -1697,6 +1907,9 @@ class ADB():
             if result:
                 img_name, value = result
                 output[img_name] = value
+                save_path = self._save_match_crop(main_img, img_name, value)
+                if save_path:
+                    self.log(f"已保存匹配截图: {save_path}", 'info')
                 # 记录命中：全屏绝对坐标 + 实测屏幕尺寸 + 已核验标记，供下一帧局部优先搜索
                 self._find_cache[img_name] = {
                     'x': value[0], 'y': value[1],
